@@ -108,11 +108,29 @@ OTHER DEALINGS IN THE SOFTWARE.
 namespace MINICORO_NAMESPACE {
 
 
+///definition of allocator interface
+template<typename T>
+concept coro_allocator = (requires(T &val, void *ptr, std::size_t sz, float b, char c) {
+    ///static function alloc which should accept multiple arguments where one argument can be reference to its instance - returns void *
+    /** the first argument must be size */
+    {T::alloc(sz, val, b, c, ptr)} -> std::same_as<void *>;
+    ///static function dealloc which should accept pointer and size of allocated space
+    {T::dealloc(ptr, sz)};
+} || std::is_void_v<T>);  //void can be specified in meaning of default allocator
+
+
 
 template<typename T, typename Obj, typename Fn>
 concept is_member_fn_call_for_result = requires(T val, Obj obj, Fn fn) {
     {((*obj).*fn)(std::move(val))};
 };
+
+
+template<typename T> class awaitable;
+template<typename T, std::invocable<awaitable<T> &> _CB, typename Allocator = void> class awaiting_callback;
+template<typename T, coro_allocator _Allocator = void> class coroutine;
+template<typename T> class coro_frame;
+template<typename T> class awaitable_result;
 
 
 ///await or co_await function has been canceled
@@ -176,12 +194,13 @@ protected:
     std::unique_ptr<void,deleter> _coro;
 };
 
-template<typename T>
-class awaitable;
 
-template<typename T, std::invocable<awaitable<T> &> _CB, typename Allocator = void>
-class awaiting_callback;
-
+///minimum size required for awaiting_callback working with given T
+/**
+ * @tparam T type of awaitable passed to the callback (awaitable<T>)
+ * @tparam _CB type of callback class/function/functor.
+ * @return the constant cointains size of the callback frame in bytes. This value is available during compile time
+ */
 template<typename T, std::invocable<awaitable<T> &> _CB>
 constexpr std::size_t awaiting_callback_size = sizeof(awaiting_callback<T, _CB, void>);
 
@@ -209,52 +228,17 @@ public:
 };
 
 }
-inline void (*async_unhandled_exception)() = []{std::terminate();};
 
-///construct coroutine
+///pointer to function, which is called when unhandled exception is caused by a coroutine (or similar function)
 /**
- * @tparam T result type
- * @tparam _Allocator allocator. If it is void, it uses standard allocator (malloc)
- *
- * The coroutine can return anything which is convertible to T. It can
- * also return a function (lambda function) which returns T - this can achieve
- * RVO.
- *
- * @code
- * co_return [&]{ return 42;}
- * @endcode
- *
- * The returned value from the lambda function is returned with respect to RVO,
- * so the returned object can be immovable, and still can be returned from
- * the coroutine
- *
- * If the object is initialized and not awaited, the coroutine is
- * started in detached state. You need to call destroy() if you need
- * to destroy already initialized coroutine.
- *
- * You can destroy the coroutine anytime when you have a handle. In this
- * case, the awaiting coroutine receives exception canceled_exception
+ * Called when unhandled_exception() function cannot pass exception object to the result. This can 
+ * happen when coroutine is started in detached mode and throws an exception.
+ * 
+ * You can change function and implement own version. Returning from the function ignores any futher
+ * processing of the exception, so it is valid code to store or log the exception and return to 
+ * resume normal execution.
  */
-template<typename T, typename _Allocator = void>
-class coroutine;
-
-template<typename T>
-class coro_frame;
-
-template<typename T>
-class awaitable_result;
-
-
-///definition of allocator interface
-template<typename T>
-concept coro_allocator = (requires(T &val, void *ptr, std::size_t sz, float b, char c) {
-    ///static function alloc which should accept multiple arguments where one argument can be reference to its instance - returns void *
-    /** the first argument must be size */
-    {T::alloc(sz, val, b, c, ptr)} -> std::same_as<void *>;
-    ///static function dealloc which should accept pointer and size of allocated space
-    {T::dealloc(ptr, sz)};
-} || std::is_void_v<T>);  //void can be specified in meaning of default allocator
-
+inline void (*async_unhandled_exception)() = []{std::terminate();};
 
 ///helper class modifying new and delete of the object to use minicoro's specific allocator
 template<coro_allocator _Allocator>
@@ -298,6 +282,30 @@ namespace _details {
     };
 }
 
+///construct coroutine
+/**
+ * @tparam T result type
+ * @tparam _Allocator allocator. If it is void, it uses standard allocator (malloc)
+ *
+ * The coroutine can return anything which is convertible to T. It can
+ * also return a function (lambda function) which returns T - this can achieve
+ * RVO.
+ *
+ * @code
+ * co_return [&]{ return 42;}
+ * @endcode
+ *
+ * The returned value from the lambda function is returned with respect to RVO,
+ * so the returned object can be immovable, and still can be returned from
+ * the coroutine
+ *
+ * If the object is initialized and not awaited, the coroutine is
+ * started in detached state. You need to call destroy() if you need
+ * to destroy already initialized coroutine.
+ *
+ * You can destroy the coroutine anytime when you have a handle. In this
+ * case, the awaiting coroutine receives exception canceled_exception
+ */
 template<typename T>
 class coroutine<T, void>{
 public:
@@ -445,7 +453,7 @@ protected:
  * self instance from arguments. If it needs instance for deallocation, it
  * must store pointer to self within allocated block
  */
-template<typename T, typename _Allocator>
+template<typename T, coro_allocator _Allocator>
 class coroutine: public coroutine<T, void> {
 public:
 
@@ -635,8 +643,6 @@ public:
         throw canceled_exception();
     }
 
-
-
     ///handles suspension
     /**
      * @param h coroutine currently suspended
@@ -655,7 +661,6 @@ public:
             return h;
         }
     }
-
 
     ///set callback, which is called once the awaitable is resolved
     /**
@@ -1190,12 +1195,6 @@ inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Alloca
     return out;
 }
 
-/*
-template<typename T>
-template<std::invocable<awaitable<T> &> _Callback, int n>
-prepared_coro awaitable<T>::set_callback (_Callback &&cb, char (&buffer)[n]) {
-}
-*/
 
 ///a emulation of coroutine which sets atomic flag when it is resumed
 class sync_frame : public coro_frame<sync_frame> {
@@ -1264,7 +1263,7 @@ template<typename T, typename ... Us>
 constexpr auto count_type_v = count_type<T, Us ...>::value;
 
 
-///holds a memort which can be reused for coroutine frame
+///holds a memory which can be reused for coroutine frame
 /**
  * The allocator can hold one coroutine at time. You should avoid
  * multiple active coroutines. This is not checked, so result of
