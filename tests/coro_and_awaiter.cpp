@@ -40,12 +40,15 @@ struct callback_by_member {
 };
 
 void test1(std::ostream &out) {
+    auto cb = [&](awaitable<int> &result) {
+        out << result.await_resume() << '/';
+    };
+    char buffer[awaiting_callback_size<int, decltype(cb)>];
+
 
     test_void(out);
     auto r = test1_call();
-    r >> [&](awaitable<int> &result) {
-        out << result.await_resume() << '/';
-    };
+    r.set_callback(std::move(cb), buffer);
     prom=42;
 
     callback_by_member bar;

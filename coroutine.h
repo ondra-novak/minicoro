@@ -95,11 +95,10 @@ OTHER DEALINGS IN THE SOFTWARE.
 #include <coroutine>
 #include <stdexcept>
 #include <memory>
-#include <atomic>
 #include <utility>
 #include <deque>
-#include <span>
 #include <optional>
+#include <span>
 
 #ifndef MINICORO_NAMESPACE
 #define MINICORO_NAMESPACE minicoro
@@ -133,10 +132,6 @@ class invalid_state: public std::exception {
 public:
     virtual const char *what() const noexcept override {return "invalid state";}
 };
-
-
-template<typename T>
-class promise_type_base;
 
 ///contains prepared coroutine.
 /** If object is destroyed, coroutine is resumed. You can resume
@@ -184,7 +179,13 @@ protected:
 template<typename T>
 class awaitable;
 
+template<typename T, std::invocable<awaitable<T> &> _CB, typename Allocator = void>
+class awaiting_callback;
 
+template<typename T, std::invocable<awaitable<T> &> _CB>
+constexpr std::size_t awaiting_callback_size = sizeof(awaiting_callback<T, _CB, void>);
+
+namespace _details {
 
 ///coroutine promise base - helper object
 template<typename T>
@@ -207,20 +208,8 @@ public:
 
 };
 
-
-
-
-///contains last unhandled exception of resumed coroutine
-inline thread_local std::exception_ptr last_unhandled_exception;
-
-///thrown any unhandled exception and clear state
-void throw_unhandled_exception() {
-    if (last_unhandled_exception) {
-        std::rethrow_exception(std::exchange(last_unhandled_exception, {}));
-    }
 }
-
-
+inline void (*async_unhandled_exception)() = []{std::terminate();};
 
 ///construct coroutine
 /**
@@ -250,25 +239,35 @@ template<typename T, typename _Allocator = void>
 class coroutine;
 
 template<typename T>
-struct coro_frame;
+class coro_frame;
 
 template<typename T>
 class awaitable_result;
 
-template<typename _Allocator>
+
+///definition of allocator interface
+template<typename T>
+concept coro_allocator = (requires(T &val, void *ptr, std::size_t sz, float b, char c) {
+    ///static function alloc which should accept multiple arguments where one argument can be reference to its instance - returns void *
+    /** the first argument must be size */
+    {T::alloc(sz, val, b, c, ptr)} -> std::same_as<void *>;
+    ///static function dealloc which should accept pointer and size of allocated space
+    {T::dealloc(ptr, sz)};
+} || std::is_void_v<T>);  //void can be specified in meaning of default allocator
+
+
+///helper class modifying new and delete of the object to use minicoro's specific allocator
+template<coro_allocator _Allocator>
 class object_allocated_by_allocator {
 public:
-
     void operator delete(void *ptr, std::size_t sz) {
         _Allocator::dealloc(ptr, sz);
     }
-
     template<typename ... Args>
     void *operator new(std::size_t sz, Args  && ... args) {
         void *ptr = _Allocator::alloc(sz, std::forward<Args>(args)... );
         return ptr;
     }
-
     template<typename ... Args>
     void operator delete(void *ptr, Args  && ... args) {
         if constexpr(sizeof...(Args) == 1) {
@@ -277,21 +276,33 @@ public:
             throw std::logic_error("unreachable");
         }
     }
-
-
-    void *operator new(std::size_t sz);
-
-
 };
+
 
 template<>
 class object_allocated_by_allocator<void> {};
+
+namespace _details {
+    template<int n>
+    class alloc_in_buffer {
+    public:
+        alloc_in_buffer(char *buff):_buff(buff) {}
+        template<typename ... Args>
+        static void *alloc(std::size_t sz, alloc_in_buffer &inst, Args && ... ) {
+            if (sz > n) throw std::bad_alloc();
+            return inst._buff;
+        }
+        static void dealloc(auto, auto) {}
+    protected:
+        char *_buff;
+    };
+}
 
 template<typename T>
 class coroutine<T, void>{
 public:
 
-    class promise_type: public promise_type_base<T> {
+    class promise_type: public _details::promise_type_base<T> {
     public:
 
         struct finisher {
@@ -299,11 +310,23 @@ public:
             constexpr bool await_ready() const noexcept {
                 return !me->_target;
             }
+            #if _MSC_VER && defined(_DEBUG) 
+            //BUG in MSVC - in debug mode, symmetric transfer cannot be used
+            //because return value of await_suspend is located in destroyed
+            //coroutine context. This is not issue for release
+            //build as the return value is stored in register
+            constexpr void await_suspend(std::coroutine_handle<> h) noexcept {
+                auto p = me->wakeup();
+                h.destroy();
+                p.resume();
+            }
+            #else
             constexpr std::coroutine_handle<> await_suspend(std::coroutine_handle<> h) noexcept {
                 auto p = me->wakeup();
                 h.destroy();
                 return p.symmetric_transfer();
             }
+            #endif
             static constexpr void await_resume() noexcept {}
 
         };
@@ -319,7 +342,7 @@ public:
             if (this->_target) {
                 this->set_exception(std::current_exception());
             } else {
-                last_unhandled_exception = std::current_exception();
+                async_unhandled_exception();
             }
         }
         coroutine get_return_object()  {
@@ -471,7 +494,7 @@ public:
     using store_type = std::conditional_t<std::is_void_v<T>, bool, T>;
     ///contains alias for result object
     using result = awaitable_result<T>;
-
+    ///allows to use awaitable to write coroutines
     using promise_type = coroutine<T>::promise_type;
 
     ///construct with no value
@@ -634,17 +657,74 @@ public:
     }
 
 
-    ///attach a callback, which is called once the awaitable is resolved
+    ///set callback, which is called once the awaitable is resolved
     /**
      * @param cb callback function. The function receives reference
      * to awaitable in resolved state
      * @return prepared coroutine (if there is an involved one), you
      * can postpone its resumption by storing result and release it
      * later
+     * 
+     * @note you can set only one callback or coroutine
      */
     template<std::invocable<awaitable &> _Callback>
     prepared_coro operator >> (_Callback &&cb) {
-        return attach_callback(std::forward<_Callback>(cb));
+        return set_callback_internal(std::forward<_Callback>(cb));
+    }
+
+    ///set callback, which is called once the awaitable is resolved
+    /**
+     * @param cb callback function. The function receives reference
+     * to awaitable in resolved state
+     * @return prepared coroutine (if there is an involved one), you
+     * can postpone its resumption by storing result and release it
+     * later
+     * 
+     * @note you can set only one callback or coroutine
+     */
+    template<std::invocable<awaitable &> _Callback>
+    prepared_coro set_callback (_Callback &&cb) {
+        return set_callback_internal(std::forward<_Callback>(cb));
+    }
+
+    ///set callback, which is called once the awaitable is resolved
+    /**
+     * @param cb callback function. The function receives reference
+     * to awaitable in resolved state
+     * @param a allocator instance, allows to allocate callback 
+     * instance using this allocator
+     * @return prepared coroutine (if there is an involved one), you
+     * can postpone its resumption by storing result and release it
+     * later
+     * 
+     * @note you can set only one callback or coroutine
+     */
+    template<std::invocable<awaitable &> _Callback, coro_allocator _Allocator>
+    prepared_coro set_callback (_Callback &&cb, _Allocator &a) {
+        return set_callback_internal(std::forward<_Callback>(cb), a);
+    }
+
+    ///set callback, which is called once the awaitable is resolved
+    /**
+     * @param cb callback function. The function receives reference
+     * to awaitable in resolved state
+     * @param buffer reference to a buffer space where callback will be
+     * allocated. The buffer must be large enough to fit the callback. 
+     * You can use template awaiting_callback_size to calculate minimum 
+     * space required for the callback. This number is available during
+     * compile time
+     * 
+     * @return prepared coroutine (if there is an involved one), you
+     * can postpone its resumption by storing result and release it
+     * later
+     * 
+     * @note you can set only one callback or coroutine
+     */
+    template<std::invocable<awaitable &> _Callback, int n>
+    prepared_coro set_callback (_Callback &&cb, char (&buffer)[n]) {
+            static_assert(awaiting_callback_size<T, _Callback> <= n, "Callback doesn't fit to buffer");
+            _details::alloc_in_buffer<n> a(buffer);
+            return set_callback_internal(std::forward<_Callback>(cb), a);
     }
 
     ///synchronous await
@@ -817,12 +897,13 @@ protected:
         return prepared_coro(std::exchange(_owner, {}));
     }
 
-    template<typename _Callback>
-    prepared_coro attach_callback(_Callback &&cb);
+    template<typename _Callback, typename ... _Allocator>
+    requires(sizeof...(_Allocator)<2)
+    prepared_coro set_callback_internal(_Callback &&cb, _Allocator & ... a);
 
 
     friend class awaitable_result<T>;
-    friend class promise_type_base<T>;
+    friend class _details::promise_type_base<T>;
 };
 
 
@@ -958,7 +1039,7 @@ protected:
 
 ///coroutine promise base - helper object
 template<>
-class promise_type_base<void> {
+class _details::promise_type_base<void> {
 public:
 
     awaitable<void> *_target = {};
@@ -988,7 +1069,8 @@ public:
  * if someone calls destroy() delete is called
  */
 template<typename FrameImpl>
-struct coro_frame {
+class coro_frame {
+protected:
     void (*resume)(std::coroutine_handle<>) = [](std::coroutine_handle<> h) {
         auto *me = reinterpret_cast<FrameImpl *>(h.address());
         me->do_resume();
@@ -1005,6 +1087,8 @@ struct coro_frame {
         auto *me = static_cast<FrameImpl *>(this);
         delete me;
     }
+
+public:
     ///convert the frame to coroutine_handle.
     std::coroutine_handle<> get_handle() {
         return std::coroutine_handle<>::from_address(this);
@@ -1039,41 +1123,79 @@ protected:
     Fn _fn;
 };
 
+template<typename T, std::invocable<awaitable<T> &> _CB, typename Allocator >
+class awaiting_callback : public coro_frame<awaiting_callback<T, _CB, Allocator> >
+                        , public object_allocated_by_allocator<Allocator>
+{
+public:
+    static std::pair<std::coroutine_handle<>, awaitable<T> *> create(_CB &&cb) {
+        awaiting_callback *n = new awaiting_callback(std::forward<_CB>(cb));
+        return {n->get_handle(), &n->_awt};
+    }
+
+    template<std::convertible_to<Allocator &> A>
+    static std::pair<std::coroutine_handle<>, awaitable<T> *> create(_CB &&cb, A &&a) {
+        Allocator &alloc = a;
+        awaiting_callback *n = new(alloc) awaiting_callback(std::forward<_CB>(cb));
+        return {n->get_handle(), &n->_awt};
+    }
+protected:
+    awaiting_callback(_CB &&cb):_cb(std::forward<_CB>(cb)) {}    
+
+    _CB _cb;
+    awaitable<T> _awt = {nullptr};
+
+    void do_resume() {
+        try {
+            _cb(_awt);
+            do_destroy();
+        } catch (...) {
+            async_unhandled_exception();
+            do_destroy();
+        }
+    }
+    void do_destroy() {
+        delete this;
+    }
+
+    friend class coro_frame<awaiting_callback<T, _CB, Allocator> >;
+};
 
 
-template<typename T>
-template<typename _Callback>
-inline prepared_coro awaitable<T>::attach_callback(_Callback &&cb) {
+template <typename T>
+template <typename _Callback, typename... _Allocator>
+    requires(sizeof...(_Allocator) < 2)
+inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Allocator &...a)
+{
 
     prepared_coro out = {};
 
     if (await_ready()) {
         cb(*this);
     } else {
-        constexpr auto runner = [](_Callback cb, auto &&info_out) -> coroutine<void> {
-            awaitable<T> awt(nullptr);
-            auto fn = [&](std::coroutine_handle<> h){
-                awt._owner = h;
-                info_out(awt);
-            };
-            co_await suspend<decltype(fn)&>(fn);
-            cb(awt);
-        };
-        runner(std::forward<_Callback>(cb),[&](awaitable<T> &awt){
-            if (_state == callback) {
-                out = get_local_callback()->call(result(&awt));
-            } else if (_state == callback_ptr) {
-                out =_callback_ptr->call(result(&awt));
-            } else if (_state == coro) {
-                out = _coro.start(result(&awt));
-            } else {
-                awt.set_exception(std::make_exception_ptr(invalid_state()));
-            }
-        });
+
+        auto [h, awt] =  awaiting_callback<T, _Callback, _Allocator ... >::create(std::forward<_Callback>(cb), a ...);
+        awt->_owner = h;
+        if (_state == callback) {
+            out = get_local_callback()->call(result(awt));
+        } else if (_state == callback_ptr) {
+            out =_callback_ptr->call(result(awt));
+        } else if (_state == coro) {
+            out = _coro.start(result(awt));
+        } else {
+            h.destroy();
+            throw invalid_state();
+        }
     }
     return out;
 }
 
+/*
+template<typename T>
+template<std::invocable<awaitable<T> &> _Callback, int n>
+prepared_coro awaitable<T>::set_callback (_Callback &&cb, char (&buffer)[n]) {
+}
+*/
 
 ///a emulation of coroutine which sets atomic flag when it is resumed
 class sync_frame : public coro_frame<sync_frame> {
@@ -1094,7 +1216,7 @@ public:
     }
 
 protected:
-    friend struct coro_frame<sync_frame>;
+    friend class coro_frame<sync_frame>;
     std::atomic<bool> _signal = {};
     void do_resume() {
         _signal = true;
@@ -1340,7 +1462,7 @@ public:
     prepared_coro add(awaitable<X> &awt, unsigned int uid) {
         slot *sel = _first_free.load();
         if (sel) {
-            while (!_first_free.compare_exchange_weak(sel, sel->next));
+            while (!_first_free.compare_exchange_weak(sel, sel->_next));
             sel->reset(uid);
         } else {
             _sls.emplace_back(this, uid);
@@ -1383,19 +1505,19 @@ protected:
         ///pointer to owner
         anyof_set *owner = nullptr;
         ///next in linked list
-        slot *next = nullptr;
+        slot *_next = nullptr;
         ///assigned uid
-        unsigned int uid = 0;
+        unsigned int _uid = 0;
 
         ///construct
-        slot(anyof_set *owner, unsigned int uid):owner(owner),uid(uid) {}
+        slot(anyof_set *owner, unsigned int uid):owner(owner),_uid(uid) {}
 
         ///called when coroutine is resumed because operation is complete
         prepared_coro do_resume() {
             //init next pointer
-            next = nullptr;
+            _next = nullptr;
             //put self into _done_stack atomically
-            while (!owner->_done_stack.compare_exchange_weak(next, this));
+            while (!owner->_done_stack.compare_exchange_weak(_next, this));
             //try to acquire current awaitable pointer (and disable it for others)
             auto w = owner->cur_awaiting.exchange(nullptr);
             //if success
@@ -1414,8 +1536,8 @@ protected:
             return {};
         }
         void reset(unsigned int uid) {
-            this->uid = uid;
-            this->next = nullptr;
+            this->_uid = uid;
+            this->_next = nullptr;
         }
     };
     std::atomic<awaitable<unsigned int> *> cur_awaiting = {};
@@ -1436,8 +1558,8 @@ protected:
             //reverse stack to queue
             while (p) {
                 auto z = p;
-                z = z->next;
-                p->next = _done_queue;
+                z = z->_next;
+                p->_next = _done_queue;
                 _done_queue = p;
                 p = z;
             }
@@ -1447,12 +1569,12 @@ protected:
             //pick it
             auto r = _done_queue;
             //remove from queue
-            _done_queue = r->next;
+            _done_queue = r->_next;
             //get uid
-            auto uid = r->uid;
-            r->next = nullptr;
+            auto uid = r->_uid;
+            r->_next = nullptr;
             //place slot to free list
-            while (!_first_free.compare_exchange_weak(r->next, r));
+            while (!_first_free.compare_exchange_weak(r->_next, r));
             //return uid
             return uid;
         }
@@ -1480,12 +1602,12 @@ protected:
                 auto w = cur_awaiting.exchange(nullptr);
                 //we successed, so there is no parallel operation yet
                 if (w) {
-                    awaitable_result<unsigned int> r(w);
+                    awaitable_result<unsigned int> r2(w);
                     //pop from queue
                     auto sr = pop_queue();
                     if (sr) {
                         //extract result and set the awaiter
-                        return r(*sr);
+                        return r2(*sr);
                     }
                 }
                 //if awaitable has been picked, the issue will be solved in other thread
