@@ -266,6 +266,8 @@ public:
 template<>
 class object_allocated_by_allocator<void> {};
 
+
+
 namespace _details {
     template<int n>
     class alloc_in_buffer {
@@ -504,6 +506,23 @@ public:
     using result = awaitable_result<T>;
     ///allows to use awaitable to write coroutines
     using promise_type = coroutine<T>::promise_type;
+
+    ///helper template to construct member function callback (with this as closure)
+    /**
+     * @tparam _Class name of class of this
+     * @tparam member pointer to member function to call
+     * 
+     * main benefit is you can calculate size of the class in compile time
+     */
+    template<typename _CLass, prepared_coro (_CLass::*member)(awaitable &)>
+    class member_callback {
+        _CLass *_ptr;
+    public:
+        member_callback(_CLass *me):_ptr(me){}
+        prepared_coro operator()(awaitable &x)  const {
+            return (_ptr->*member)(x);
+        }
+    };
 
     ///construct with no value
     awaitable(std::nullptr_t) {};
@@ -1032,7 +1051,7 @@ public:
 
 protected:
     struct deleter {
-        void operator()(awaitable<T> *ptr) const {
+        constexpr void operator()(awaitable<T> *ptr) const {
             auto e = std::current_exception();
             if (e) ptr->set_exception(std::move(e)); else ptr->drop();
             ptr->wakeup();
