@@ -7,12 +7,12 @@ namespace MINICORO_NAMESPACE {
 ///implements concurrency mutex
 /**
  * This mutex can be used inside of coroutines and can be held across co_await and across multiple threads
- * 
+ *
  * There is difference of standard mutex. This mutex contains own guard, named ownership. Your code
  * holds mutex while it holds ownership. Releasing ownership causes releasing mutex. The
  * ownership object is movable, but not copyable. You can construct ownership without owning
  * the mutex (this can be tested)
- * 
+ *
  * @code
  * auto own = co_await mx.lock();
  * co_await async_op();
@@ -40,9 +40,9 @@ public:
         ///release ownership prematurely
         /** this allows to release ownership before the object expires. After execution this
          * function, the object loose ownership
-         * 
-         * This also allows to schedule and resumption any awaiting coroutine 
-         * 
+         *
+         * This also allows to schedule and resumption any awaiting coroutine
+         *
          * @return prepared coroutine which received ownership (if any). You can schedule its resumption
          */
         prepared_coro release() {
@@ -84,15 +84,15 @@ public:
         if (_requests.compare_exchange_strong(need, get_doorman())) return this;
         else return {};
     }
-    
-    ///attempt to lock, allow to co?await 
+
+    ///attempt to lock, allow to co?await
     /**
-     * @return returns awaitable. To acquire lock, you need to co_await on awaitable. 
-     * 
+     * @return returns awaitable. To acquire lock, you need to co_await on awaitable.
+     *
      * @note The state of awaitable depends on whether try_lock successed. In successful
      * try_lock(), it immediately returns ownership and no waiting is required. Otherwise
-     * it is set to pending state and you need to co_await on it to obtain ownership. 
-     * 
+     * it is set to pending state and you need to co_await on it to obtain ownership.
+     *
      * The acquire process starts after co_await is initiated. You can discard return value
      * which cancels the operation (releasing ownership if has been acquired by try_lock())
      */
@@ -104,8 +104,8 @@ public:
         //otherwise create slot and add self to waiting queue
         return [s = slot(), this](awaitable<ownership>::result r) mutable {
             //retrieve awaitable as pointer
-            s._resume = r.release();       
-            //add slot as request     
+            s._resume = r.release();
+            //add slot as request
             return add_request(&s);
         };
     }
@@ -115,13 +115,15 @@ protected:
     //item of linked list of the requests and queue
     struct slot {
         //next item in linked list
-        slot *_next = {};
+        slot *_next;
         //pointer to awaitable to be resolved when ownership is retrieved
-        awaitable<ownership> *_resume = {};
+        awaitable<ownership> *_resume;
+
     };
 
-    //specific slot acts as doorman - blind requests which is always first in the stack
-    static constexpr  slot doorman = {};
+    constexpr static slot doorman = {};
+
+
     //stack of requests - added between unlocks
     std::atomic<slot *> _requests = {};
     //queue of requests - processed during unlocks
@@ -166,14 +168,14 @@ protected:
     }
 
     //unlock and transfer ownership
-    prepared_coro unlock() {       
-        //if queue is empty, probably nobody is waiting 
-        if (!_queue) {            
+    prepared_coro unlock() {
+        //if queue is empty, probably nobody is waiting
+        if (!_queue) {
             slot *d = get_doorman();
             slot *need = d;
             //try exchange doorman by nullptr
             if (_requests.compare_exchange_strong(need, nullptr)) {
-                //if successed, lock is unlocked 
+                //if successed, lock is unlocked
                 //nothing to resume
                 return {};
             }
@@ -192,8 +194,8 @@ protected:
 
 ///implements multiple coro_mutex locking
 /**
- * @tpatam n count of mutexes. This value is subject of CTAG. 
- * You can set this value higher than actuall mutex count, but you must ensure, that extra space is filled by nullptrs. 
+ * @tpatam n count of mutexes. This value is subject of CTAG.
+ * You can set this value higher than actuall mutex count, but you must ensure, that extra space is filled by nullptrs.
  * (with exception, the first pointer must not be nullptr)
  */
 template<int n>
@@ -217,18 +219,18 @@ public:
      * The function ensures that no deadlock happen as the unsuccessful lock of particular mutex
      * causes rollback of other locks and new attempt. This can cause repeatedly acquire and release all mutexes
      * during the process
-     * 
+     *
      * The function returns awaitable void, because the object holds the ownership (so you can release them by
      * destroying this object). It is possible to retrieve ownership by function get_ownership() which can
      * be useful, if you need move ownership around
-     * 
+     *
      */
     awaitable<void> lock() {
         //try lock first
         auto o = locking[0]->try_lock();
         //if success
         if (o) {
-            //try lock others 
+            //try lock others
             int x = lock_others();
             //if success (all locked);
             if (x == n) {
@@ -258,36 +260,6 @@ public:
 
 protected:
 
-    ///a callback function intended to call this object if lock is complete
-    using resolve_cb = awaitable<coro_mutex::ownership>::member_callback<multi_lock, &multi_lock::lock_complete>;
-    
-    prepared_coro lock_first() {
-        //initiate lock - call the callback when done - use cb_buffer to store callback's internals
-        return locking[first]->lock().set_callback(resolve_cb(this), cb_buffer);
-    }
-    
-    int lock_others() {
-        //start with first until n
-        for (int i = 1; i < n; ++i) {
-            //calculate index
-            int idx = (i+first) % n;
-            //if not null
-            if (locking[idx]) {
-                //try to lock
-                auto o = locking[idx]->try_lock();
-                if (!o) {
-                    //if failed, release all ownerships
-                    for (auto &x: owns) x.release();
-                    //return failed index
-                    return i;
-                }            
-            }
-        }
-        //return max as no failure
-        return n;
-
-    }
-
     prepared_coro lock_complete(coro_mutex::ownership &&own) {
         //when lock is complete, remeber ownership
         owns[first] = std::move(own);
@@ -304,6 +276,37 @@ protected:
         return r();
     }
 
+
+    ///a callback function intended to call this object if lock is complete
+    using resolve_cb = awaitable<coro_mutex::ownership>::member_callback<multi_lock, &multi_lock::lock_complete>;
+
+    prepared_coro lock_first() {
+        //initiate lock - call the callback when done - use cb_buffer to store callback's internals
+        return locking[first]->lock().set_callback(resolve_cb(this), cb_buffer);
+    }
+
+    int lock_others() {
+        //start with first until n
+        for (int i = 1; i < n; ++i) {
+            //calculate index
+            int idx = (i+first) % n;
+            //if not null
+            if (locking[idx]) {
+                //try to lock
+                auto o = locking[idx]->try_lock();
+                if (!o) {
+                    //if failed, release all ownerships
+                    for (auto &x: owns) x.release();
+                    //return failed index
+                    return i;
+                }
+            }
+        }
+        //return max as no failure
+        return n;
+
+    }
+
     //list of mutexes
     coro_mutex *locking[n] = {};
     //list of ownership
@@ -311,7 +314,7 @@ protected:
     //result
     awaitable<void>::result r = {};
     //buffer to store callback's internals
-    char cb_buffer[awaiting_callback_size<coro_mutex::ownership, resolve_cb>];    
+    char cb_buffer[awaiting_callback_size<coro_mutex::ownership, resolve_cb>];
     //first mutex to lock asynchronously
     int first = 0;
 };

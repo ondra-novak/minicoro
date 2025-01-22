@@ -99,6 +99,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 #include <deque>
 #include <optional>
 #include <span>
+#include <atomic>
 
 #ifndef MINICORO_NAMESPACE
 #define MINICORO_NAMESPACE minicoro
@@ -231,11 +232,11 @@ public:
 
 ///pointer to function, which is called when unhandled exception is caused by a coroutine (or similar function)
 /**
- * Called when unhandled_exception() function cannot pass exception object to the result. This can 
+ * Called when unhandled_exception() function cannot pass exception object to the result. This can
  * happen when coroutine is started in detached mode and throws an exception.
- * 
+ *
  * You can change function and implement own version. Returning from the function ignores any futher
- * processing of the exception, so it is valid code to store or log the exception and return to 
+ * processing of the exception, so it is valid code to store or log the exception and return to
  * resume normal execution.
  */
 inline void (*async_unhandled_exception)() = []{std::terminate();};
@@ -320,7 +321,7 @@ public:
             constexpr bool await_ready() const noexcept {
                 return !me->_target;
             }
-            #if _MSC_VER && defined(_DEBUG) 
+            #if _MSC_VER && defined(_DEBUG)
             //BUG in MSVC - in debug mode, symmetric transfer cannot be used
             //because return value of await_suspend is located in destroyed
             //coroutine context. This is not issue for release
@@ -511,7 +512,7 @@ public:
     /**
      * @tparam _Class name of class of this
      * @tparam member pointer to member function to call
-     * 
+     *
      * main benefit is you can calculate size of the class in compile time
      */
     template<typename _CLass, prepared_coro (_CLass::*member)(awaitable &)>
@@ -688,7 +689,7 @@ public:
      * @return prepared coroutine (if there is an involved one), you
      * can postpone its resumption by storing result and release it
      * later
-     * 
+     *
      * @note you can set only one callback or coroutine
      */
     template<std::invocable<awaitable &> _Callback>
@@ -703,7 +704,7 @@ public:
      * @return prepared coroutine (if there is an involved one), you
      * can postpone its resumption by storing result and release it
      * later
-     * 
+     *
      * @note you can set only one callback or coroutine
      */
     template<std::invocable<awaitable &> _Callback>
@@ -715,12 +716,12 @@ public:
     /**
      * @param cb callback function. The function receives reference
      * to awaitable in resolved state
-     * @param a allocator instance, allows to allocate callback 
+     * @param a allocator instance, allows to allocate callback
      * instance using this allocator
      * @return prepared coroutine (if there is an involved one), you
      * can postpone its resumption by storing result and release it
      * later
-     * 
+     *
      * @note you can set only one callback or coroutine
      */
     template<std::invocable<awaitable &> _Callback, coro_allocator _Allocator>
@@ -733,15 +734,15 @@ public:
      * @param cb callback function. The function receives reference
      * to awaitable in resolved state
      * @param buffer reference to a buffer space where callback will be
-     * allocated. The buffer must be large enough to fit the callback. 
-     * You can use template awaiting_callback_size to calculate minimum 
+     * allocated. The buffer must be large enough to fit the callback.
+     * You can use template awaiting_callback_size to calculate minimum
      * space required for the callback. This number is available during
      * compile time
-     * 
+     *
      * @return prepared coroutine (if there is an involved one), you
      * can postpone its resumption by storing result and release it
      * later
-     * 
+     *
      * @note you can set only one callback or coroutine
      */
     template<std::invocable<awaitable &> _Callback, int n>
@@ -784,8 +785,12 @@ public:
             case exception:return awaitable(_exception);
         }
     }
-
-    bool is_pending() const {
+    ///return if there is someone awaiting on object
+    /**
+     * @retval true someone is awaiting, do not destroy the object
+     * @retval false nobody awaiting
+     */
+    bool is_awaiting() const {
         return _owner != std::coroutine_handle<>();
     }
 
@@ -874,7 +879,7 @@ protected:
     }
 
     void dtor() {
-        if (is_pending()) throw invalid_state();
+        if (is_awaiting()) throw invalid_state();
         destroy_state();
     }
 
@@ -917,7 +922,7 @@ protected:
     }
 
     prepared_coro wakeup() {
-        if (_state != no_value && _state != value && _state != exception) drop();
+        if (!is_ready()) drop();
         return prepared_coro(std::exchange(_owner, {}));
     }
 
@@ -1051,7 +1056,7 @@ public:
 
 protected:
     struct deleter {
-        constexpr void operator()(awaitable<T> *ptr) const {
+        void operator()(awaitable<T> *ptr) const {
             auto e = std::current_exception();
             if (e) ptr->set_exception(std::move(e)); else ptr->drop();
             ptr->wakeup();
@@ -1164,7 +1169,7 @@ public:
         return {n->get_handle(), &n->_awt};
     }
 protected:
-    awaiting_callback(_CB &&cb):_cb(std::forward<_CB>(cb)) {}    
+    awaiting_callback(_CB &&cb):_cb(std::forward<_CB>(cb)) {}
 
     _CB _cb;
     awaitable<T> _awt = {nullptr};
