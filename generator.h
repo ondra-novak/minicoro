@@ -8,8 +8,8 @@ namespace MINICORO_NAMESPACE {
 /**
  * @tparam T type accepted by co_yield and returned from call operator
  * @tparam Allocator specifies allocator for coroutine frame
- * 
- * @note the generator is allowed to use co_await for awaiting on asynchronous operations. 
+ *
+ * @note the generator is allowed to use co_await for awaiting on asynchronous operations.
  */
 template<typename T, typename Allocator = void>
 class async_generator {
@@ -23,7 +23,7 @@ public:
     public:
         ///promise
         _details::promise_type_base<T> _prom;
-        
+
 
         ///awaiter for yield
         struct yield_awaiter: std::suspend_always {
@@ -39,8 +39,8 @@ public:
         /**
          * @param val a value convertible to T, or a invocable (functor) which returns T. If
          * the invocable is passed, it is called to construct T at place where awaitable is
-         * located (RVO is used). 
-         * 
+         * located (RVO is used).
+         *
          * @return the function returns awaiter which returns void
          */
         template<typename X>
@@ -67,7 +67,7 @@ public:
         async_generator get_return_object() {
             return this;
         }
-        ///resume for next cycle 
+        ///resume for next cycle
         /**
          * @param r variable that receives co_yield value
          * @return holds handle to generator which will be resumed once the return value is destroyed
@@ -85,15 +85,13 @@ public:
 
     ///call the generator
     /**
-     * @return the generator returns awaitable, you can co_await on result, or you can assign result to 
+     * @return the generator returns awaitable, you can co_await on result, or you can assign result to
      * a variable to perform synchronous wait.
-     * 
-     * @note If the generator fhishes its operation, return value is no-value awaitable. You can test return
-     * value by using operator! or operator!! if this is case. 
-     * 
+     *
+     *
      * @code
      * awaitable<int> gen = finite_generator();
-     * for (auto iter = gen(); co_await !!iter; iter = gen()) {
+     * for (auto iter = gen(); co_await iter.has_value(); iter = gen()) {
      *      int r = val;    //
      *      //work with r
      * }

@@ -114,22 +114,38 @@ template<typename T>
 concept coro_allocator = (requires(T &val, void *ptr, std::size_t sz, float b, char c) {
     ///static function alloc which should accept multiple arguments where one argument can be reference to its instance - returns void *
     /** the first argument must be size */
-    {T::alloc(sz, val, b, c, ptr)} -> std::same_as<void *>;
+    {T::overrides::operator new(sz, val, b, c, ptr)} -> std::same_as<void *>;
     ///static function dealloc which should accept pointer and size of allocated space
-    {T::dealloc(ptr, sz)};
-} || std::is_void_v<T>);  //void can be specified in meaning of default allocator
+    {T::overrides::operator delete(ptr, sz)};
+});  //void can be specified in meaning of default allocator
 
+///represents standard allocator
+/**
+ * Some templates uses this class as placeholder for standard allocation, however it can be used
+ * as any other allocator
+ */
+class objstdalloc {
+public:
+    struct overrides {
+        template<typename ... Args>
+        void *operator new(std::size_t sz, Args && ...) {
+            return ::operator new(sz);
+        }
+        void operator delete(void *ptr, std::size_t) {
+            ::operator delete(ptr);
+        }
+    };
+};
 
-
+///tests whether object T  can be used as member function pointer with Obj as pointer
 template<typename T, typename Obj, typename Fn>
 concept is_member_fn_call_for_result = requires(T val, Obj obj, Fn fn) {
     {((*obj).*fn)(std::move(val))};
 };
 
-
 template<typename T> class awaitable;
-template<typename T, std::invocable<awaitable<T> &> _CB, typename Allocator = void> class awaiting_callback;
-template<typename T, coro_allocator _Allocator = void> class coroutine;
+template<typename T, std::invocable<awaitable<T> &> _CB, coro_allocator _Allocator = objstdalloc> class awaiting_callback;
+template<typename T, coro_allocator _Allocator = objstdalloc> class coroutine;
 template<typename T> class coro_frame;
 template<typename T> class awaitable_result;
 
@@ -141,9 +157,9 @@ template<typename T> class awaitable_result;
  * on non-coroutine object
  *
  */
-class canceled_exception: public std::exception {
+class await_canceled_exception: public std::exception {
 public:
-    virtual const char *what() const noexcept override {return "canceled exception";}
+    virtual const char *what() const noexcept override {return "await canceled exception";}
 };
 
 ///object is in invalid state
@@ -203,7 +219,19 @@ protected:
  * @return the constant cointains size of the callback frame in bytes. This value is available during compile time
  */
 template<typename T, std::invocable<awaitable<T> &> _CB>
-constexpr std::size_t awaiting_callback_size = sizeof(awaiting_callback<T, _CB, void>);
+constexpr std::size_t awaiting_callback_size = sizeof(awaiting_callback<T, _CB, objstdalloc>);
+
+///pointer to function, which is called when unhandled exception is caused by a coroutine (or similar function)
+/**
+ * Called when unhandled_exception() function cannot pass exception object to the result. This can
+ * happen when coroutine is started in detached mode and throws an exception.
+ *
+ * You can change function and implement own version. Returning from the function ignores any futher
+ * processing of the exception, so it is valid code to store or log the exception and return to
+ * resume normal execution.
+ */
+inline void (*async_unhandled_exception)() = []{std::terminate();};
+
 
 namespace _details {
 
@@ -228,61 +256,21 @@ public:
 
 };
 
-}
-
-///pointer to function, which is called when unhandled exception is caused by a coroutine (or similar function)
-/**
- * Called when unhandled_exception() function cannot pass exception object to the result. This can
- * happen when coroutine is started in detached mode and throws an exception.
- *
- * You can change function and implement own version. Returning from the function ignores any futher
- * processing of the exception, so it is valid code to store or log the exception and return to
- * resume normal execution.
- */
-inline void (*async_unhandled_exception)() = []{std::terminate();};
-
-///helper class modifying new and delete of the object to use minicoro's specific allocator
-template<coro_allocator _Allocator>
-class object_allocated_by_allocator {
+template<int n>
+class alloc_in_buffer {
 public:
-    void operator delete(void *ptr, std::size_t sz) {
-        _Allocator::dealloc(ptr, sz);
-    }
-    template<typename ... Args>
-    void *operator new(std::size_t sz, Args  && ... args) {
-        void *ptr = _Allocator::alloc(sz, std::forward<Args>(args)... );
-        return ptr;
-    }
-    template<typename ... Args>
-    void operator delete(void *ptr, Args  && ... args) {
-        if constexpr(sizeof...(Args) == 1) {
-            (_Allocator::dealloc(ptr, args),...);
-        } else {
-            throw std::logic_error("unreachable");
-        }
-    }
-};
-
-
-template<>
-class object_allocated_by_allocator<void> {};
-
-
-
-namespace _details {
-    template<int n>
-    class alloc_in_buffer {
-    public:
-        alloc_in_buffer(char *buff):_buff(buff) {}
+    alloc_in_buffer(char *buff):_buff(buff) {}
+    struct overrides {
         template<typename ... Args>
-        static void *alloc(std::size_t sz, alloc_in_buffer &inst, Args && ... ) {
+        void *operator new(std::size_t sz, alloc_in_buffer &inst, Args && ... ) {
             if (sz > n) throw std::bad_alloc();
             return inst._buff;
         }
-        static void dealloc(auto, auto) {}
-    protected:
-        char *_buff;
+        void operator delete(void *, std::size_t) {}
     };
+protected:
+    char *_buff;
+};
 }
 
 ///construct coroutine
@@ -310,7 +298,7 @@ namespace _details {
  * case, the awaiting coroutine receives exception canceled_exception
  */
 template<typename T>
-class coroutine<T, void>{
+class coroutine<T, objstdalloc>{
 public:
 
     class promise_type: public _details::promise_type_base<T> {
@@ -457,22 +445,22 @@ protected:
  * must store pointer to self within allocated block
  */
 template<typename T, coro_allocator _Allocator>
-class coroutine: public coroutine<T, void> {
+class coroutine: public coroutine<T, objstdalloc> {
 public:
 
-    using coroutine<T, void>::coroutine;
+    using coroutine<T, objstdalloc>::coroutine;
 
-    class promise_type: public coroutine<T, void>::promise_type,  object_allocated_by_allocator<_Allocator> {
+    class promise_type: public coroutine<T, objstdalloc>::promise_type,  public _Allocator::overrides {
     public:
         coroutine<T, _Allocator> get_return_object() {
           return this;
         }
 
-        using object_allocated_by_allocator<_Allocator>::operator new;
-        using object_allocated_by_allocator<_Allocator>::operator delete;
+        using _Allocator::overrides::operator new;
+        using _Allocator::overrides::operator delete;
 
     };
-    coroutine(promise_type *p):coroutine<T, void>(p) {}
+    coroutine(promise_type *p):coroutine<T, objstdalloc>(p) {}
 };
 
 ///Awatable object. Indicates asynchronous result
@@ -552,7 +540,7 @@ public:
         :_state(value),_value(std::forward<Args>(args)...) {}
 
     ///construct by coroutine awaitable for its completion
-    awaitable(coroutine<T, void> coroutine):_state(coro),_coro(std::move(coroutine)) {}
+    awaitable(coroutine<T> coroutine):_state(coro),_coro(std::move(coroutine)) {}
 
     ///construct containing result constructed by arguments
     template<typename ... Args>
@@ -570,6 +558,15 @@ public:
             std::construct_at(&_callback_ptr, std::make_unique<CallbackImpl<Fn> >(std::forward<Fn>(fn)));
             _state = callback_ptr;
         }
+    }
+
+    ///construct unresolved containing function which is after suspension of the awaiting coroutine
+    /** This version ensures, that function will not be allocated on heap */
+    template<std::invocable<result> Fn>
+    awaitable(std::in_place_t, Fn &&fn) {
+        static_assert(sizeof(CallbackImpl<Fn>) <= callback_max_size, "Function doesn't fit to reserved space");
+        new (_callback_space) CallbackImpl<Fn>(std::forward<Fn>(fn));
+        _state = callback;
     }
 
     ///construct containing result - in exception state
@@ -611,42 +608,42 @@ public:
         return *this;
     }
 
-    template<bool b>
-    class pending_awaiter {
-    public:
-        pending_awaiter(awaitable &owner):owner(owner) {}
-        bool await_ready() const {return owner.await_ready();}
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<> h) {
-            return owner.await_suspend(h);
-        }
-        bool await_resume() const {
-            return (owner._state == no_value) == b;
-        }
-        explicit operator bool() const {
-            owner.wait();
-            return await_resume();
-        }
-        pending_awaiter<!b> operator!() const {return owner;}
 
-    protected:
-        awaitable &owner;
-    };
+    ///returns whether the object has a value
+    /**
+     * @return the result is awaitable, so you can co_await to retrieve
+     * whether the awaitable receives a value (without throwing an exception)
+     */
+    awaitable<bool> has_value();
 
-    ///returns true if the awaitable is no_value state
-    /** If awaitable is still pending, function blocks. However you can co_await it */
-    pending_awaiter<true> operator!() noexcept {
-        return *this;
-    }
-
-    ///return true, if the awaitable is resolved
-    bool await_ready() const noexcept {
-        return _state == no_value || _state == value || _state == exception;
-    }
+    ///returns whether the object has no value
+    /**
+     * @return the result is awaitable, so you can co_await to retrieve
+     * whether the awaitable receives a value (without throwing an exception)
+     */
+    awaitable<bool> operator!() ;
 
     ///returns true if the awaitable is resolved
     bool is_ready() const {
         return await_ready();
     }
+
+    ///returns iterator a value
+    /**
+     * @return iterator to value if value is stored there, otherwise returns end
+     * @note the function is awaitable, you can co_await if the value is not yet available.
+     */
+    awaitable<store_type *> begin();
+
+    ///returns iterator to end
+    /**
+     * @return iterator to end
+     * @note this function is not awaitable it always return valid end()
+     */
+    store_type *end()  {
+        return &_value+1;
+    }
+
 
     ///returns value of resolved awaitable
     std::add_rvalue_reference_t<T> await_resume() {
@@ -660,7 +657,13 @@ public:
         } else if (_state == exception) {
             std::rethrow_exception(_exception);
         }
-        throw canceled_exception();
+        throw await_canceled_exception();
+    }
+
+
+    ///return true, if the awaitable is resolved
+    bool await_ready() const noexcept {
+        return _state == no_value || _state == value || _state == exception;
     }
 
     ///handles suspension
@@ -694,7 +697,8 @@ public:
      */
     template<std::invocable<awaitable &> _Callback>
     prepared_coro operator >> (_Callback &&cb) {
-        return set_callback_internal(std::forward<_Callback>(cb));
+        objstdalloc a;
+        return set_callback_internal(std::forward<_Callback>(cb), a);
     }
 
     ///set callback, which is called once the awaitable is resolved
@@ -754,20 +758,18 @@ public:
 
     ///synchronous await
     decltype(auto) await() {
-        return wait().await_resume();
+        wait();
+        return await_resume();
     }
 
     ///synchronous await
     operator store_type&&() {
-        return wait().await_resume();
+        wait();
+        return await_resume();
     }
 
     ///evaluate asynchronous operation, waiting for result synchronously
-    /**
-     * Function blocks execution until the asynchronous operation is complete
-     * @retval reference to this object, so you can chain additional operation
-     */
-    awaitable &&wait();
+    void wait();
 
 
     ///copy evaluated awaitable object.
@@ -794,6 +796,22 @@ public:
         return _owner != std::coroutine_handle<>();
     }
 
+    ///Create result object from existing awaitable object
+    /**
+     * This function is used by awaiting_callback to create result object
+     * on its internal awaiter. However it allows you to create result from
+     * coroutine handle which is awaiting on result and awaitable object itself
+     * where the coroutine expects the result. The awaitable object is set
+     * to is_awaiting() state
+     *
+     * @param h handle of coroutine which is resumed once the value is set
+     * @return result object
+     */
+    result create_result(std::coroutine_handle<> h) {
+        if (_owner) throw invalid_state();
+        _owner = h;
+        return result(this);
+    }
 
 protected:
 
@@ -845,7 +863,7 @@ protected:
         Fn _fn;
     };
 
-    static constexpr auto callback_max_size = std::max(sizeof(void *) * 4, sizeof(store_type));
+    static constexpr auto callback_max_size = std::max(sizeof(void *) * 6, sizeof(store_type));
 
     ///current state of object
     State _state = no_value;
@@ -926,10 +944,29 @@ protected:
         return prepared_coro(std::exchange(_owner, {}));
     }
 
-    template<typename _Callback, typename ... _Allocator>
-    requires(sizeof...(_Allocator)<2)
-    prepared_coro set_callback_internal(_Callback &&cb, _Allocator & ... a);
+    template<typename _Callback, typename _Allocator>
+    prepared_coro set_callback_internal(_Callback &&cb, _Allocator &a);
 
+    template<bool test>
+    struct read_state_frame: coro_frame<read_state_frame<test> >{
+        awaitable *src;
+        awaitable<bool> *result = {};
+
+        read_state_frame(awaitable *src):src(src) {}
+
+        void do_resume();
+        void do_destroy() {}
+    };
+
+    struct read_ptr_frame: coro_frame<read_ptr_frame>{
+        awaitable *src;
+        awaitable<store_type *> *result = {};
+
+        read_ptr_frame(awaitable *src):src(src) {}
+
+        void do_resume();
+        void do_destroy() {}
+    };
 
     friend class awaitable_result<T>;
     friend class _details::promise_type_base<T>;
@@ -1152,28 +1189,58 @@ protected:
     Fn _fn;
 };
 
-template<typename T, std::invocable<awaitable<T> &> _CB, typename Allocator >
-class awaiting_callback : public coro_frame<awaiting_callback<T, _CB, Allocator> >
-                        , public object_allocated_by_allocator<Allocator>
+///Contains function which can be called through awaitable<T>::result object
+/**
+ * The function works as a coroutine associated with existing awaitable, but
+ * the awaitable instance is not visible for the user. You can only
+ * call this function through the result object
+ *
+ *
+ * @tparam T type of return value (can be void)
+ * @tparam _CB callback function. It must accept reference to internal awaitable
+ * object, where it can retrieve value
+ * @tparam _Allocator can specify allocator used to allocate the function (similar to coroutine)
+ *
+ * @note main benefit of this class is that you can calculate size of the occupied
+ * memory during compile time. This is not possible for standard coroutines. Knowing
+ * the occupied size allows to reserve buffers for its allocation.
+ *
+ */
+template<typename T, std::invocable<awaitable<T> &> _CB, coro_allocator _Allocator >
+class awaiting_callback : public coro_frame<awaiting_callback<T, _CB, _Allocator> >
+                        , public _Allocator::overrides
 {
 public:
-    static std::pair<std::coroutine_handle<>, awaitable<T> *> create(_CB &&cb) {
+    ///Create result object to call specified callback function
+    /**
+     * @param cb callback function
+     * @return result object
+     */
+    static typename awaitable<T>::result create(_CB &&cb) {
         awaiting_callback *n = new awaiting_callback(std::forward<_CB>(cb));
-        return {n->get_handle(), &n->_awt};
+        return n->_awt.create_result(n->get_handle());
     }
 
-    template<std::convertible_to<Allocator &> A>
-    static std::pair<std::coroutine_handle<>, awaitable<T> *> create(_CB &&cb, A &&a) {
-        Allocator &alloc = a;
+    ///Create result object to call specified callback function
+    /**
+     * @param cb callback function
+     * @param alloc reference allocator instance which is used to allocate this object
+     * @return result object
+     */
+    static typename awaitable<T>::result create(_CB &&cb, _Allocator &alloc) {
         awaiting_callback *n = new(alloc) awaiting_callback(std::forward<_CB>(cb));
-        return {n->get_handle(), &n->_awt};
+        return n->_awt.create_result(n->get_handle());
     }
 protected:
+    ///constructor is not visible on the API
     awaiting_callback(_CB &&cb):_cb(std::forward<_CB>(cb)) {}
 
+    ///callback function itself
     _CB _cb;
+    ///awaitable object associated with the function
     awaitable<T> _awt = {nullptr};
 
+    ///called when resume is triggered
     void do_resume() {
         try {
             _cb(_awt);
@@ -1187,14 +1254,13 @@ protected:
         delete this;
     }
 
-    friend class coro_frame<awaiting_callback<T, _CB, Allocator> >;
+    friend class coro_frame<awaiting_callback<T, _CB, _Allocator> >;
 };
 
 
 template <typename T>
-template <typename _Callback, typename... _Allocator>
-    requires(sizeof...(_Allocator) < 2)
-inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Allocator &...a)
+template <typename _Callback, typename _Allocator>
+inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Allocator &a)
 {
 
     prepared_coro out = {};
@@ -1203,17 +1269,13 @@ inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Alloca
         cb(*this);
     } else {
 
-        auto [h, awt] =  awaiting_callback<T, _Callback, _Allocator ... >::create(std::forward<_Callback>(cb), a ...);
-        awt->_owner = h;
+        auto res = awaiting_callback<T, _Callback, _Allocator>::create(std::forward<_Callback>(cb), a);
         if (_state == callback) {
-            out = get_local_callback()->call(result(awt));
+            out = get_local_callback()->call(std::move(res));
         } else if (_state == callback_ptr) {
-            out =_callback_ptr->call(result(awt));
+            out =_callback_ptr->call(std::move(res));
         } else if (_state == coro) {
-            out = _coro.start(result(awt));
-        } else {
-            h.destroy();
-            throw invalid_state();
+            out = _coro.start(std::move(res));
         }
     }
     return out;
@@ -1249,19 +1311,18 @@ protected:
 };
 
 template<typename T>
-inline awaitable<T> && awaitable<T>::wait() {
+inline void awaitable<T>::wait() {
     if (!await_ready()) {
         sync_frame sync;
         await_suspend(sync.get_handle()).resume();
         sync.wait();
     }
-    return std::move(*this);
 }
 
 
 
 template<typename T>
-inline T coroutine<T, void>::await() {
+inline T coroutine<T>::await() {
     awaitable<T> awt(std::move(*this));
    if constexpr(std::is_void_v<T>) {
        awt.await();
@@ -1332,25 +1393,27 @@ public:
         return me;
     }
 
-    template<typename ... Args>
-    static void *alloc(std::size_t sz, Args && ... args) {
-        static_assert(count_type_v<reusable_allocator &, Args ...> == 1,
-                "The coroutine must include `reusable_allocator &` into argument list (once)");
-        reusable_allocator *me = find_me(args...);
-        if (me) {
-            if (me->_buffer_size < sz) {
-                ::operator delete(me->_buffer);
-                me->_buffer = ::operator new(sz);
-                me->_buffer_size = sz;
+    struct overrides {
+
+        template<typename ... Args>
+        void *operator new(std::size_t sz, Args && ... args) {
+            static_assert(count_type_v<reusable_allocator &, Args ...> == 1,
+                    "The coroutine must include `reusable_allocator &` into argument list (once)");
+            reusable_allocator *me = find_me(args...);
+            if (me) {
+                if (me->_buffer_size < sz) {
+                    ::operator delete(me->_buffer);
+                    me->_buffer = ::operator new(sz);
+                    me->_buffer_size = sz;
+                }
+                return me->_buffer;
+            } else {
+                throw invalid_state();
             }
-            return me->_buffer;
-        } else {
-            throw invalid_state();
         }
-    }
 
-    static void dealloc(void *, std::size_t) {}
-
+        void operator delete (void *, std::size_t) {}
+    };
 
 protected:
     void *_buffer = {};
@@ -1516,7 +1579,7 @@ public:
      * returns next evaluated awaitable
      */
     unsigned int wait() {
-        return check().wait();
+        return check().await();
     }
 
 
@@ -1638,9 +1701,55 @@ protected:
             return {};
         };
     }
-
-
 };
 
+template<typename T>
+template<bool test>
+void awaitable<T>::read_state_frame<test>::do_resume() {
+           bool n = src->_state != no_value;
+           awaitable<bool>::result(this->result)(n == test);
+}
+
+template<typename T>
+void awaitable<T>::read_ptr_frame::do_resume() {
+    typename awaitable<store_type *>::result r(this->result);
+    if (src->_state == value) {
+        r(&src->_value);
+    } else if (src->_state == exception) {
+        r = src->_exception;
+    } else {
+        r(&src->_value+1);
+    }
+}
+
+template<typename T>
+awaitable<bool> awaitable<T>::operator!()  {
+    if (await_ready()) {return _state == no_value;}
+    return awaitable<bool>(std::in_place,[frm = read_state_frame<false>(this)](awaitable<bool>::result r) mutable{
+        frm.result = r.release();
+        return frm.src->await_suspend(frm.get_handle());
+    });
+
+}
+template<typename T>
+awaitable<bool> awaitable<T>::has_value() {
+    if (await_ready()) {return _state != no_value;}
+    return awaitable<bool>(std::in_place,[frm = read_state_frame<true>(this)](awaitable<bool>::result r) mutable{
+        frm.result = r.release();
+        return frm.src->await_suspend(frm.get_handle());
+    });
+}
+
+template<typename T>
+awaitable<typename awaitable<T>::store_type *> awaitable<T>::begin() {
+    if (await_ready()) {
+        auto &&val = await_resume();
+        return &val;
+    }
+    return awaitable<store_type *>(std::in_place, [frm = read_ptr_frame(this)](awaitable<store_type *>::result r) mutable {
+        frm.result = r.release();
+        return frm.src->await_suspend(frm.get_handle());
+    });
+}
 
 }

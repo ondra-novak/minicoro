@@ -48,7 +48,7 @@ coroutine<void> async_fibo_test2() {
     auto gen = async_fibo(10);
     auto iter = std::begin(results);
     auto val = gen();
-    while (co_await !!val) {
+    while (co_await val.has_value()) {
         int v = val;
         CHECK_EQUAL(v,*iter);
         val = gen();
@@ -61,7 +61,7 @@ coroutine<void> async_fibo_test3() {
     int results[] = {1,1,2,3,5,8,13,21,34,55};
     auto gen = async_fibo(10);
     auto iter = std::begin(results);
-    for (auto val = gen(); co_await !!val; val = gen()) {
+    for (auto val = gen(); co_await val.has_value(); val = gen()) {
         int v = val;
         CHECK_EQUAL(v,*iter);
         ++iter;
@@ -69,6 +69,16 @@ coroutine<void> async_fibo_test3() {
     CHECK(iter == std::end(results));
 }
 
+int test_end() {
+    int r = 0;
+    auto g = fibo(10);
+    auto a = g();
+    while (a.has_value()) {
+        a = g();
+        ++r;
+    }
+    return r;
+}
 
 int main() {
 
@@ -80,6 +90,8 @@ int main() {
         ++iter;
         CHECK_EQUAL(x,v);
     }
+
+    CHECK_EQUAL(test_end(), 10);
 
     iter = std::begin(results);
     for (int v: async_fibo(10)) {

@@ -1,6 +1,7 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include "check.h"
 
 #include "../coroutine.h"
 
@@ -56,8 +57,6 @@ void test1(std::ostream &out) {
     out << x << '/';
 }
 
-
-
 coroutine<std::string> switch_thread() {
 
     auto id = co_await awaitable<std::string>([](auto r){
@@ -93,6 +92,23 @@ void reusable_test(std::ostream &out) {
     out << total;
 }
 
+struct test_struct {
+    int val;
+};
+
+awaitable<test_struct> test_pointer_access_fn() {
+    return [](auto prom){
+        return prom(test_struct{42});
+    };
+}
+
+awaitable<void> test_pointer_access_coro() {
+    auto awt = test_pointer_access_fn();
+    for (auto iter = co_await awt.begin(); iter != awt.end(); ++iter) {
+        CHECK_EQUAL(iter->val, 42);
+    }
+}
+
 int main() {
     std::ostringstream s;
     test1(s);
@@ -101,5 +117,6 @@ int main() {
     test_awaitable_in_thread(s);
     if (s.view() != "different") return 2;
     reusable_test(std::cout);
+    test_pointer_access_coro().wait();
     return 0;
 }

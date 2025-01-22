@@ -102,12 +102,12 @@ public:
         //if success, return it directly
         if (test) return test;
         //otherwise create slot and add self to waiting queue
-        return [s = slot(), this](awaitable<ownership>::result r) mutable {
+        return awaitable<ownership>(std::in_place,[s = slot(), this](awaitable<ownership>::result r) mutable {
             //retrieve awaitable as pointer
             s._resume = r.release();
             //add slot as request
             return add_request(&s);
-        };
+        });
     }
 
 
