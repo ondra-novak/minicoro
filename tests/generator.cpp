@@ -1,4 +1,4 @@
-#include "../generator.h"
+#include "../async_generator.h"
 
 #include "check.h"
 

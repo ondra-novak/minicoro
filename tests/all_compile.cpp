@@ -1,5 +1,5 @@
 #include "../coroutine.h"
-#include "../generator.h"
+#include "../async_generator.h"
 #include "../coro_mutex.h"
 #include "../coro_queue.h"
 #include <iostream>

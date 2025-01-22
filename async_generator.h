@@ -1,6 +1,7 @@
 #pragma once
 
 #include "coroutine.h"
+#include <vector>
 namespace MINICORO_NAMESPACE {
 
 
@@ -23,15 +24,21 @@ public:
     public:
         ///promise
         _details::promise_type_base<T> _prom;
+        bool _stop_flag = false;
 
 
         ///awaiter for yield
         struct yield_awaiter: std::suspend_always {
+            bool *stop_flag;
             std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
                 promise_type &me =h.promise();
                 auto r =  me._prom.wakeup();
                 me._prom._target = nullptr;
+                stop_flag = &me._stop_flag;
                 return r.symmetric_transfer();
+            }
+            bool await_resume() noexcept {
+                return !(*stop_flag);
             }
         };
 
@@ -47,6 +54,10 @@ public:
         requires(std::is_constructible_v<T, X> || std::is_invocable_r_v<T, X>)
         yield_awaiter yield_value(X &&val) {
             _prom.return_value(std::forward<X>(val));
+            return {};
+        }
+        yield_awaiter yield_value(std::exception_ptr e) {
+            _prom.set_exception(std::move(e));
             return {};
         }
 
@@ -72,16 +83,23 @@ public:
          * @param r variable that receives co_yield value
          * @return holds handle to generator which will be resumed once the return value is destroyed
          */
-        prepared_coro next(typename awaitable<T>::result r) {
+        prepared_coro next(typename awaitable<T>::result r, bool request_stop) {
             auto h = std::coroutine_handle<promise_type>::from_promise(*this);
             if (h.done()) return {};
             _prom._target = r.release();
             return prepared_coro(h);
         }
+
     };
 
     ///construct unitialized generator
     async_generator() = default;
+
+    async_generator(async_generator &&) = default;
+    async_generator &operator=(async_generator &&) = default;
+
+    template<typename Alloc>
+    async_generator(async_generator<T, Alloc> &&other):_g(std::move(other._g)) {}
 
     ///call the generator
     /**
@@ -102,6 +120,14 @@ public:
         if (!_g) return nullptr;
         return [this](auto r){
             return _g->next(std::move(r));
+        };
+    }
+
+    awaitable<T> request_stop() {
+        //if generator is not initialized, return no-value
+        if (!_g) return nullptr;
+        return [this](auto r){
+            return _g->request_stop(std::move(r));
         };
     }
 
@@ -210,5 +236,41 @@ protected:
 template<typename T, typename Alloc = void>
 using generator = async_generator<T, Alloc>;
 
+
+template<typename T, typename Allocator>
+async_generator<T, Allocator> generator_agregator(Allocator &alloc, std::vector<generator<T> > g) {
+
+    std::vector<awaitable<T> > awts;
+    for (auto &x: g) awts.emplace(x());
+    anyof_set s;
+    unsigned int cnt = 0;
+    for (auto &x: awts) s.add(x, cnt++);
+    while (cnt) {
+        unsigned int n = co_await s;
+        awaitable<T> &a = awts[n];
+        if (a.has_value()) {
+            std::exception_ptr e;
+            try {
+                co_yield a.await_resume();            
+                a = g[n]();
+                s.add(a,n);
+                continue;
+            } catch (...) {
+                e = std::current_exception();            
+            }
+            co_yield std::move(e);
+        } 
+        --cnt;        
+    }
+}
+
+
+
+template<typename T>
+async_generator<T> generator_agregator(std::vector<generator<T> > g) {
+    objstdalloc a;
+    return generator_agregator(std::move(g), a);
+
+}
 
 }

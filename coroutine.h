@@ -1173,29 +1173,6 @@ public:
 };
 
 
-///an awaitable object which suspends current coroutine and calls a function with its handle
-/**
- * @code
- * co_await suspend([](std::coroutine_handle<> my_handle) {
- *          //do anything with handle
- *          //eventually resume coroutine
- *          my_handle.resume();
- * });
- * @endcode
- * @tparam Fn
- */
-template<std::invocable<std::coroutine_handle<> > Fn>
-class suspend : public std::suspend_always{
-public:
-    suspend(Fn &&fn):_fn(std::forward<Fn>(fn)) {}
-    void await_suspend(std::coroutine_handle<> h) {
-        _fn(h);
-    }
-
-protected:
-    Fn _fn;
-};
-
 ///Contains function which can be called through awaitable<T>::result object
 /**
  * The function works as a coroutine associated with existing awaitable, but
@@ -1339,22 +1316,6 @@ inline T coroutine<T>::await() {
    }
 }
 
-template<typename T, typename ... Us>
-struct count_type;
-template<typename T>
-struct count_type<T> {
-    static constexpr unsigned int value = 0;
-};
-
-template<typename T, typename Head, typename ... Tail>
-struct count_type<T, Head, Tail...> {
-    static constexpr unsigned int value = (std::is_same_v<T, Head> ? 1:0)
-                + count_type<T, Tail...>::value;
-};
-template<typename T, typename ... Us>
-constexpr auto count_type_v = count_type<T, Us ...>::value;
-
-
 ///holds a memory which can be reused for coroutine frame
 /**
  * The allocator can hold one coroutine at time. You should avoid
@@ -1387,26 +1348,17 @@ public:
     reusable_allocator &operator=(const reusable_allocator &) = delete;
     ~reusable_allocator() {::operator delete(_buffer);}
 
-    template<typename ... Args>
-    static constexpr reusable_allocator *find_me(Args && ... args) {
-        constexpr auto finder = [](reusable_allocator *& me, auto &&k) {
-            if (me) return;
-            if constexpr(std::is_same_v<decltype(k), reusable_allocator &>) {
-                me = &k;
-            }
-        };
-        reusable_allocator *me = nullptr;
-        (finder(me, args), ...);
-        return me;
-    }
-
-    struct overrides {
+   struct overrides {
 
         template<typename ... Args>
+        requires((std::is_same_v<reusable_allocator &, Args> ||...))
         void *operator new(std::size_t sz, Args && ... args) {
-            static_assert(count_type_v<reusable_allocator &, Args ...> == 1,
-                    "The coroutine must include `reusable_allocator &` into argument list (once)");
-            reusable_allocator *me = find_me(args...);
+
+            reusable_allocator *me;
+            auto finder = [&](auto &&k) {
+                if constexpr(std::is_same_v<decltype(k),reusable_allocator &>) me = &k;
+            };
+            (finder(args),...);
             if (me) {
                 if (me->_buffer_size < sz) {
                     ::operator delete(me->_buffer);
@@ -1708,6 +1660,27 @@ protected:
             return {};
         };
     }
+};
+
+///this class makes that callback function is called during destruction
+/**
+ * This is useful feature for coroutines. The function is called when coroutine 
+ * frame is destroyed regardless on how it has been destroyed.
+ * 
+ * It is called even if the frame is destroyed
+ * by destroy() function.
+ * 
+ * Outside of the coroutines, the callback 
+ * is called when associated variable is destroyed
+ * when excetuion leaves current scope.
+ */
+template<typename _CB>
+class on_destroy{
+public:
+    on_destroy(_CB &&cb):_cb(std::forward<_CB>(cb)) {}
+    ~on_destroy() {_cb();}
+protected:
+    _CB _cb;
 };
 
 template<typename T>
