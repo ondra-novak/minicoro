@@ -131,6 +131,10 @@ public:
         void *operator new(std::size_t sz, Args && ...) {
             return ::operator new(sz);
         }
+        template<typename ... Args>
+        void operator delete(void *ptr, Args && ...) {
+            ::operator delete(ptr);
+        }
         void operator delete(void *ptr, std::size_t) {
             ::operator delete(ptr);
         }
@@ -266,6 +270,9 @@ public:
             if (sz > n) throw std::bad_alloc();
             return inst._buff;
         }
+        template<typename ... Args>
+        void operator delete(void *, alloc_in_buffer &, Args && ... ) {
+        }
         void operator delete(void *, std::size_t) {}
     };
 protected:
@@ -309,7 +316,7 @@ public:
             constexpr bool await_ready() const noexcept {
                 return !me->_target;
             }
-            #if _MSC_VER && defined(_DEBUG)
+            #if _MSC_VER && defined(_DEBUG)            
             //BUG in MSVC - in debug mode, symmetric transfer cannot be used
             //because return value of await_suspend is located in destroyed
             //coroutine context. This is not issue for release
