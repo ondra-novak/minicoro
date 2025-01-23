@@ -102,12 +102,13 @@ public:
         //if success, return it directly
         if (test) return test;
         //otherwise create slot and add self to waiting queue
-        return awaitable<ownership>(std::in_place,[s = slot(), this](awaitable<ownership>::result r) mutable {
+        return [s = slot(), this](awaitable<ownership>::result r) mutable {
+            if (!r) return prepared_coro{};
             //retrieve awaitable as pointer
             s._resume = r.release();
             //add slot as request
             return add_request(&s);
-        });
+        };
     }
 
 
@@ -242,6 +243,8 @@ public:
         }
         //prepare asynchronous locking
         return [this](auto res) {
+            //do not process when operation has been canceled
+            if (!res) return prepared_coro{};
             //store result
             r = std::move(res);
             //attempt to lock first
@@ -260,9 +263,9 @@ public:
 
 protected:
 
-    prepared_coro lock_complete(coro_mutex::ownership &&own) {
+    prepared_coro lock_complete(awaitable<coro_mutex::ownership> &awt) {
         //when lock is complete, remeber ownership
-        owns[first] = std::move(own);
+        owns[first] = awt.await_resume();
         //attempt to lock others
         int x = lock_others();
         //if failed - ownership has been released

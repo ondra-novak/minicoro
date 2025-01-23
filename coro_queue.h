@@ -103,6 +103,7 @@ public:
         if (_queue.is_full()) {
             return [this,slot = slot<val_and_result>(std::forward<Args>(args)...)]
                     (awaitable<void>::result r) mutable {
+                if (!r) return;
                 slot.payload.res =std::move(r);
                 _push_queue.push(&slot);
             };
@@ -129,6 +130,7 @@ public:
         if (_queue.is_empty()) {
             return [this, slot = slot<typename awaitable<value_type>::result>({})]
                     (typename awaitable<value_type>::result r) mutable {
+             if (!r) return;
              if (_closed) {
                  r =  _closed;
                  return;

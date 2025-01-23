@@ -8,12 +8,19 @@ namespace MINICORO_NAMESPACE {
 ///generator (with asynchronous support)
 /**
  * @tparam T type accepted by co_yield and returned from call operator
+ * @tparam Param parameter which is passed to the generator with every invocation. If this
+ * argument is void, then no parameter is passed. Otherwise you must construct
+ * the argument by every invocation. The parameter is then retrieved by the generator
+ * as result of operator co_yield. See also start()
  * @tparam Allocator specifies allocator for coroutine frame
  *
  * @note the generator is allowed to use co_await for awaiting on asynchronous operations.
  */
-template<typename T, typename Allocator = void>
-class async_generator {
+template<typename T, typename Param = void, coro_allocator Allocator = objstdalloc>
+class async_generator;
+
+template<typename T, typename Param>
+class async_generator<T, Param, objstdalloc> {
 public:
 
     //yield value type
@@ -24,21 +31,22 @@ public:
     public:
         ///promise
         _details::promise_type_base<T> _prom;
-        bool _stop_flag = false;
+        std::optional<storage_type<Param> > _param;
+        bool _started = false;
 
 
         ///awaiter for yield
         struct yield_awaiter: std::suspend_always {
-            bool *stop_flag;
+            promise_type *me;
             std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
-                promise_type &me =h.promise();
-                auto r =  me._prom.wakeup();
-                me._prom._target = nullptr;
-                stop_flag = &me._stop_flag;
+                me =&h.promise();
+                auto r =  me->_prom.wakeup();
+                me->_prom._target = nullptr;
                 return r.symmetric_transfer();
             }
-            bool await_resume() noexcept {
-                return !(*stop_flag);
+            std::add_rvalue_reference_t<Param> await_resume() noexcept {
+                if constexpr(std::is_void_v<Param>) return;
+                else return std::move(*me->_param);
             }
         };
 
@@ -53,10 +61,12 @@ public:
         template<typename X>
         requires(std::is_constructible_v<T, X> || std::is_invocable_r_v<T, X>)
         yield_awaiter yield_value(X &&val) {
+            _started = true;
             _prom.return_value(std::forward<X>(val));
             return {};
         }
         yield_awaiter yield_value(std::exception_ptr e) {
+            _started = true;
             _prom.set_exception(std::move(e));
             return {};
         }
@@ -70,7 +80,6 @@ public:
 
         ///generator doesn't return value
         void return_void() {
-            //empty
         }
         void unhandled_exception() {
             _prom.set_exception(std::current_exception());
@@ -78,17 +87,25 @@ public:
         async_generator get_return_object() {
             return this;
         }
+
+        template<typename ... Args>
+        void set_param(Args &&... args) {
+            _param.emplace(std::forward<Args>(args)...);
+        }
+
         ///resume for next cycle
         /**
          * @param r variable that receives co_yield value
          * @return holds handle to generator which will be resumed once the return value is destroyed
          */
-        prepared_coro next(typename awaitable<T>::result r, bool request_stop) {
+        prepared_coro next(typename awaitable<T>::result r) {
             auto h = std::coroutine_handle<promise_type>::from_promise(*this);
             if (h.done()) return {};
             _prom._target = r.release();
             return prepared_coro(h);
         }
+
+        bool did_started() const {return _started;}
 
     };
 
@@ -114,35 +131,51 @@ public:
      *      //work with r
      * }
      * @endcode
+     *
+     * @note if the operator is used for not yet started generator, the
+     * arguments are ignored. If you need to start generator without passing
+     * arguments, use start() method
      */
-    awaitable<T> operator()() {
+    template<typename ... Args>
+    awaitable<T> operator()(Args && ... args) {
+        static_assert(std::is_constructible_v<storage_type<Param>, Args...>, "Parameter of generator is not constructible from arguments");
         //if generator is not initialized, return no-value
         if (!_g) return nullptr;
-        return [this](auto r){
+        _g->set_param(std::forward<Args>(args)...);
+        return [this](auto r)->prepared_coro{
+            if (!r) return {};
             return _g->next(std::move(r));
         };
     }
 
-    awaitable<T> request_stop() {
-        //if generator is not initialized, return no-value
-        if (!_g) return nullptr;
-        return [this](auto r){
-            return _g->request_stop(std::move(r));
+    ///start the generator
+    /**
+     * This function is useful for generators with the parameter. The very first
+     * invocation of the generator causes to execution of initial part of the
+     * generator until the first co_yield is reached. This function allows
+     * to perfrom intial invocation where the parameter is not used. The
+     * function can be called only once.
+     * @return if the generator already started, returns no-value avaitable.
+     * Otherways it returns pending awaitable which is eventually resolved with
+     * a value returned by the first co_yield.
+     *
+     * @note for non-parameter generator, there is no difference between start()
+     * and standard invocation operator. The start function can be called only
+     * once at the beginning, standard invocation operator can be called anytime
+     * regadless of state
+     *
+     */
+    awaitable<T> start() {
+        if (!_g || _g->did_started()) return nullptr;
+        return [this](auto r)->prepared_coro{
+            if (!r) return {};
+            return _g->next(std::move(r));
         };
     }
 
-    ///call the generator indirectly
-    /**
-     * @param yield_result an awaitable<>::result variable which receives next co_yield value.
-     * @return handle of generator's coroutine as prepared_coro, you can discard the return value
-     * to resume the generator.
-     */
-    prepared_coro operator()(awaitable<T>::result yield_result) {
-        if (_g) return _g->next(std::move(yield_result));
-        return {};
-    }
 
     ///input iterator - converts generator to iteratable object
+    /** Iterator is not supported for generators with parameter */
     class iterator {
     public:
 
@@ -233,15 +266,26 @@ protected:
 
 };
 
-template<typename T, typename Alloc = void>
-using generator = async_generator<T, Alloc>;
+template<typename T, typename Param , coro_allocator Allocator>
+class async_generator : public async_generator<T, Param, objstdalloc> {
+public:
+    using async_generator<T, Param, objstdalloc>::async_generator;
+
+    class promise_type : public async_generator<T, Param, objstdalloc>::promise_type,
+                         public Allocator::overrides{
+    };
+};
 
 
-template<typename T, typename Allocator>
-async_generator<T, Allocator> generator_agregator(Allocator &alloc, std::vector<generator<T> > g) {
+template<typename T, typename Param = void, coro_allocator Alloc = objstdalloc>
+using generator = async_generator<T, Param, Alloc>;
+
+
+template<typename T, typename Param, typename Allocator>
+async_generator<T, Param, Allocator> generator_agregator(Allocator &, std::vector<generator<T, Param> > g) {
 
     std::vector<awaitable<T> > awts;
-    for (auto &x: g) awts.emplace(x());
+    for (auto &x: g) awts.emplace(x.start());
     anyof_set s;
     unsigned int cnt = 0;
     for (auto &x: awts) s.add(x, cnt++);
@@ -251,23 +295,23 @@ async_generator<T, Allocator> generator_agregator(Allocator &alloc, std::vector<
         if (a.has_value()) {
             std::exception_ptr e;
             try {
-                co_yield a.await_resume();            
+                co_yield a.await_resume();
                 a = g[n]();
                 s.add(a,n);
                 continue;
             } catch (...) {
-                e = std::current_exception();            
+                e = std::current_exception();
             }
             co_yield std::move(e);
-        } 
-        --cnt;        
+        }
+        --cnt;
     }
 }
 
 
 
-template<typename T>
-async_generator<T> generator_agregator(std::vector<generator<T> > g) {
+template<typename T, typename Param>
+async_generator<T> generator_agregator(std::vector<generator<T, Param> > g) {
     objstdalloc a;
     return generator_agregator(std::move(g), a);
 

@@ -141,6 +141,12 @@ public:
     };
 };
 
+///replaces simple void everywhere valid type is required
+struct void_type {};
+
+///converts T to valid type. Converts void to void_type, otherwise left type as it is
+template<typename T> using storage_type = std::conditional_t<std::is_void_v<T>, void_type, T>;
+
 ///tests whether object T  can be used as member function pointer with Obj as pointer
 template<typename T, typename Obj, typename Fn>
 concept is_member_fn_call_for_result = requires(T val, Obj obj, Fn fn) {
@@ -316,7 +322,7 @@ public:
             constexpr bool await_ready() const noexcept {
                 return !me->_target;
             }
-            #if _MSC_VER && defined(_DEBUG)            
+            #if _MSC_VER && defined(_DEBUG)
             //BUG in MSVC - in debug mode, symmetric transfer cannot be used
             //because return value of await_suspend is located in destroyed
             //coroutine context. This is not issue for release
@@ -340,6 +346,10 @@ public:
         promise_type() = default;
         ~promise_type() {
             this->wakeup();
+        }
+
+        bool is_detached() const {
+            return this->_target == nullptr;
         }
 
         static constexpr std::suspend_always initial_suspend() noexcept {return {};}
@@ -419,7 +429,7 @@ public:
      * is resumed in detached mode. If you need to prevent this, you
      * need to explicitly call destroy().
      */
-    void destroy() {
+    void cancel() {
         if (_coro) {
             release().destroy();
         }
@@ -430,6 +440,39 @@ public:
         return std::coroutine_handle<promise_type>::from_promise(*std::exchange(_coro, nullptr));
     }
 
+    ///struct that helps to detect detached mode
+    struct detached_test_awaitable : std::suspend_always {
+        bool _detached = false;
+        bool await_resume() noexcept {return _detached;}
+        bool await_suspend(std::coroutine_handle<> h) noexcept {
+            std::coroutine_handle<promise_type> ph =
+                    std::coroutine_handle<promise_type>::from_address(h.address());
+            promise_type &p = ph.promise();
+            _detached = p.is_detached();
+            return false;
+        }
+    };
+
+    ///determines whether coroutine is running in detached mode
+    /**
+     * This can optimize processing when coroutine knows, that no result
+     * is requested, so it can skip certain parts of its code. It still
+     * needs to generate result, but it can return inaccurate result or
+     * complete invalid result
+     *
+     * to use this function, you need call it inside of coroutine body
+     * with co_await
+     *
+     * @code
+     * coroutine<int> foo() {
+     *      bool detached = co_await coroutine<int>::is_detached();
+     *      std::cout << detached?"detached":"not detached" << std::endl;
+     *      co_return 42;
+     * }
+     *
+     * @return awaitable which returns true - detached, false - not detached
+     */
+    static detached_test_awaitable is_detached() {return {};}
 protected:
 
     promise_type *_coro = nullptr;
@@ -497,7 +540,7 @@ template<typename T>
 class awaitable {
 public:
     ///contains actually stored value type. It is T unless for void, it is bool
-    using store_type = std::conditional_t<std::is_void_v<T>, bool, T>;
+    using store_type = storage_type<T>;
     ///contains alias for result object
     using result = awaitable_result<T>;
     ///allows to use awaitable to write coroutines
@@ -522,7 +565,11 @@ public:
 
     ///construct with no value
     awaitable(std::nullptr_t) {};
-    ///dtor
+    ///destructor
+    /**
+     * @note if there is prepared asynchronous operation, it is started
+     * in detached mode. If you need to cancel such operation, use cancel()
+     */
     ~awaitable() {
         dtor();
     }
@@ -565,15 +612,6 @@ public:
             std::construct_at(&_callback_ptr, std::make_unique<CallbackImpl<Fn> >(std::forward<Fn>(fn)));
             _state = callback_ptr;
         }
-    }
-
-    ///construct unresolved containing function which is after suspension of the awaiting coroutine
-    /** This version ensures, that function will not be allocated on heap */
-    template<std::invocable<result> Fn>
-    awaitable(std::in_place_t, Fn &&fn) {
-        static_assert(sizeof(CallbackImpl<Fn>) <= callback_max_size, "Function doesn't fit to reserved space");
-        new (_callback_space) CallbackImpl<Fn>(std::forward<Fn>(fn));
-        _state = callback;
     }
 
     ///construct containing result - in exception state
@@ -820,6 +858,38 @@ public:
         return result(this);
     }
 
+    ///cancel futher execution
+    /** This prevents to execute prepared asynchronous operation. You need
+     * to invoke this function if you requested only non-blocking part of
+     * operation and don't want to contine asynchronously
+     */
+    void cancel() {
+        if (_owner) throw invalid_state();
+        destroy_state();
+    }
+
+    ///determines whether coroutine is running in detached mode
+    /**
+     * This can optimize processing when coroutine knows, that no result
+     * is requested, so it can skip certain parts of its code. It still
+     * needs to generate result, but it can return inaccurate result or
+     * complete invalid result
+     *
+     * to use this function, you need call it inside of coroutine body
+     * with co_await
+     *
+     * @code
+     * awaitable<int> foo() {
+     *      bool detached = co_await awaitable<int>::is_detached();
+     *      std::cout << detached?"detached":"not detached" << std::endl;
+     *      co_return 42;
+     * }
+     *
+     * @return awaitable which returns true - detached, false - not detached
+     */
+    static typename coroutine<T>::detached_test_awaitable is_detached() {return {};}
+
+
 protected:
 
     enum State {
@@ -905,7 +975,20 @@ protected:
 
     void dtor() {
         if (is_awaiting()) throw invalid_state();
-        destroy_state();
+        switch (_state) {
+            default:break;
+            case value: std::destroy_at(&_value);break;
+            case exception: std::destroy_at(&_exception);break;
+            case coro: std::destroy_at(&_coro);break;
+            case callback:
+                get_local_callback()->call({});
+                std::destroy_at(get_local_callback());
+                break;
+            case callback_ptr:
+                _callback_ptr->call({});
+                std::destroy_at(&_callback_ptr);
+                break;
+        }
     }
 
     void destroy_state() {
@@ -913,7 +996,7 @@ protected:
             default:break;
             case value: std::destroy_at(&_value);break;
             case exception: std::destroy_at(&_exception);break;
-            case coro: _coro.destroy();std::destroy_at(&_coro);break;
+            case coro: _coro.cancel();std::destroy_at(&_coro);break;
             case callback: std::destroy_at(get_local_callback());break;
             case callback_ptr: std::destroy_at(&_callback_ptr);break;
         }
@@ -1097,6 +1180,13 @@ public:
     awaitable<T> *release() {
         return _ptr.release();
     }
+
+    ///returns true if the result is expected
+    /**
+     * @retval true result is expected
+     * @retval false result is not excpected (detached mode?)
+     */
+    explicit operator bool() const {return static_cast<bool>(_ptr);}
 
 protected:
     struct deleter {
@@ -1664,13 +1754,13 @@ protected:
 
 ///this class makes that callback function is called during destruction
 /**
- * This is useful feature for coroutines. The function is called when coroutine 
+ * This is useful feature for coroutines. The function is called when coroutine
  * frame is destroyed regardless on how it has been destroyed.
- * 
+ *
  * It is called even if the frame is destroyed
  * by destroy() function.
- * 
- * Outside of the coroutines, the callback 
+ *
+ * Outside of the coroutines, the callback
  * is called when associated variable is destroyed
  * when excetuion leaves current scope.
  */
@@ -1705,19 +1795,21 @@ void awaitable<T>::read_ptr_frame::do_resume() {
 template<typename T>
 awaitable<bool> awaitable<T>::operator!()  {
     if (await_ready()) {return _state == no_value;}
-    return awaitable<bool>(std::in_place,[frm = read_state_frame<false>(this)](awaitable<bool>::result r) mutable{
+    return [frm = read_state_frame<false>(this)](awaitable<bool>::result r) mutable -> prepared_coro {
         frm.result = r.release();
+        if (!frm.result) return {};
         return frm.src->await_suspend(frm.get_handle());
-    });
+    };
 
 }
 template<typename T>
 awaitable<bool> awaitable<T>::has_value() {
     if (await_ready()) {return _state != no_value;}
-    return awaitable<bool>(std::in_place,[frm = read_state_frame<true>(this)](awaitable<bool>::result r) mutable{
+    return [frm = read_state_frame<true>(this)](awaitable<bool>::result r) mutable -> prepared_coro {
         frm.result = r.release();
+        if (!frm.result) return {};
         return frm.src->await_suspend(frm.get_handle());
-    });
+    };
 }
 
 template<typename T>
@@ -1726,10 +1818,11 @@ awaitable<typename awaitable<T>::store_type *> awaitable<T>::begin() {
         auto &&val = await_resume();
         return &val;
     }
-    return awaitable<store_type *>(std::in_place, [frm = read_ptr_frame(this)](awaitable<store_type *>::result r) mutable {
+    return [frm = read_ptr_frame(this)](awaitable<store_type *>::result r) mutable -> prepared_coro{
         frm.result = r.release();
+        if (!frm.result) return {};
         return frm.src->await_suspend(frm.get_handle());
-    });
+    };
 }
 
 }

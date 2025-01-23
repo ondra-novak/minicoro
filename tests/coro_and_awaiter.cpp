@@ -83,13 +83,13 @@ coroutine<int, reusable_allocator> test_alloc_coro(int a, reusable_allocator &) 
     co_return a*a;
 }
 
-void reusable_test(std::ostream &out) {
+void reusable_test() {
     reusable_allocator ra;
     int total = 0;
     for (int i = 0; i < 10; ++i) {
         total = total + test_alloc_coro(i, ra);
     }
-    out << total;
+    CHECK_EQUAL(total, 285);
 }
 
 struct test_struct {
@@ -109,14 +109,25 @@ awaitable<void> test_pointer_access_coro() {
     }
 }
 
+awaitable<void> detach_test_coro(bool expect) {
+    bool b = co_await awaitable<void>::is_detached();
+    CHECK_EQUAL(b, expect);
+}
+
+void detached_test() {
+    detach_test_coro(false).wait();
+    detach_test_coro(true);
+}
+
 int main() {
     std::ostringstream s;
     test1(s);
-    if (s.view() != "In void coro/42/10/") return 1;
+    CHECK_EQUAL(s.view(),"In void coro/42/10/");
     s.str({});
     test_awaitable_in_thread(s);
-    if (s.view() != "different") return 2;
-    reusable_test(std::cout);
+    CHECK_EQUAL(s.view(),"different");
+    reusable_test();
     test_pointer_access_coro().wait();
+    detached_test();
     return 0;
 }

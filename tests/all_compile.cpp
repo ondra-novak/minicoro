@@ -7,6 +7,7 @@
 
 template class minicoro::async_generator<int>;
 template class minicoro::coro_queue<int, 128>;
+template class minicoro::multi_lock<10>;
 
 int main() {
     std::cout << sizeof(minicoro::awaitable<int>) << std::endl;
