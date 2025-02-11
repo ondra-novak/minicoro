@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "concepts": "cpp",
+        "type_traits": "cpp"
+    }
+}
