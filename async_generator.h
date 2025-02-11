@@ -31,7 +31,7 @@ public:
     public:
         ///promise
         _details::promise_type_base<T> _prom;
-        std::optional<storage_type<Param> > _param;
+        std::optional<voidless_type<Param> > _param;
         bool _started = false;
 
 
@@ -138,7 +138,7 @@ public:
      */
     template<typename ... Args>
     awaitable<T> operator()(Args && ... args) {
-        static_assert(std::is_constructible_v<storage_type<Param>, Args...>, "Parameter of generator is not constructible from arguments");
+        static_assert(std::is_constructible_v<voidless_type<Param>, Args...>, "Parameter of generator is not constructible from arguments");
         //if generator is not initialized, return no-value
         if (!_g) return nullptr;
         _g->set_param(std::forward<Args>(args)...);

@@ -144,8 +144,8 @@ public:
 ///replaces simple void everywhere valid type is required
 struct void_type {};
 
-///converts T to valid type. Converts void to void_type, otherwise left type as it is
-template<typename T> using storage_type = std::conditional_t<std::is_void_v<T>, void_type, T>;
+
+template<typename T> using voidless_type = std::conditional_t<std::is_void_v<T>, void_type, T>;
 
 ///tests whether object T  can be used as member function pointer with Obj as pointer
 template<typename T, typename Obj, typename Fn>
@@ -540,7 +540,7 @@ template<typename T>
 class awaitable {
 public:
     ///contains actually stored value type. It is T unless for void, it is bool
-    using store_type = storage_type<T>;
+    using store_type = std::conditional_t<std::is_reference_v<T>,std::reference_wrapper<voidless_type<std::remove_reference_t<T> > >, voidless_type<T> >;
     ///contains alias for result object
     using result = awaitable_result<T>;
     ///allows to use awaitable to write coroutines
@@ -695,8 +695,9 @@ public:
         if (_state == value) {
             if constexpr(std::is_void_v<T>) {
                 return;
-            }
-            else {
+            } else if constexpr(std::is_reference_v<T>) {
+                return _value.get();
+            } else {
                 return std::move(_value);
             }
         } else if (_state == exception) {
@@ -808,7 +809,7 @@ public:
     }
 
     ///synchronous await
-    operator store_type&&() {
+    operator voidless_type<T> &&() {
         wait();
         return await_resume();
     }
@@ -1080,8 +1081,9 @@ public:
     ///you can move
     awaitable_result &operator=(awaitable_result &&other) = default;
 
-    using const_reference = std::add_lvalue_reference_t<std::add_const_t<std::conditional_t<std::is_void_v<T>, bool, T> > >;
-    using rvalue_reference = std::add_rvalue_reference_t<std::conditional_t<std::is_void_v<T>, bool, T> > ;
+    using const_reference = std::add_lvalue_reference_t<std::add_const_t<std::conditional_t<std::is_void_v<T>, void_type, T> > >;
+    using rvalue_reference = std::add_rvalue_reference_t<std::conditional_t<std::is_void_v<T>, void_type, T> > ;
+
     ///set the result
     /**
      * @param val value to set
@@ -1089,6 +1091,7 @@ public:
      * is resumed immediately. You can store result and destroy it
      * later to postpone resumption.
      */
+#if 0
     prepared_coro operator=(const_reference val) {
         auto p = _ptr.release();
         if (p) {
@@ -1106,10 +1109,12 @@ public:
      * is resumed immediately. You can store result and destroy it
      * later to postpone resumption.
      */
-    prepared_coro operator=(rvalue_reference val) {
+#endif
+    template<std::convertible_to<T> X>
+    prepared_coro operator=(X &&val) {
         auto p = _ptr.release();
         if (p) {
-            p->set_value(std::move(val));
+            p->set_value(std::forward<T>(val));
             return p->wakeup();
         } else {
             return {};
@@ -1124,13 +1129,7 @@ public:
      * later to postpone resumption.
      */
     prepared_coro operator=(std::exception_ptr e) {
-        auto p = _ptr.release();
-        if (p) {
-            p->set_exception(std::move(e));
-            return p->wakeup();
-        } else {
-            return {};
-        }
+        return set_exception(e);
 
     }
 
@@ -1143,9 +1142,23 @@ public:
      */
     template<typename ... Args>
     prepared_coro operator()(Args && ... args) {
+        static_assert(sizeof...(Args) != 1 || (!std::is_same_v<std::decay_t<Args>, std::exception_ptr> && ...),
+                "To set exception, use operator=, or set_exception()");
+        static_assert(std::is_constructible_v<voidless_type<T>, Args...>,
+                "Result is not constructible from arguments");
         auto p = _ptr.release();
         if (p) {
             p->set_value(std::forward<Args>(args)...);
+            return p->wakeup();
+        } else {
+            return {};
+        }
+    }
+
+    prepared_coro set_exception(std::exception_ptr e) {
+        auto p = _ptr.release();
+        if (p) {
+            p->set_exception(std::move(e));
             return p->wakeup();
         } else {
             return {};
@@ -1815,8 +1828,8 @@ awaitable<bool> awaitable<T>::has_value() {
 template<typename T>
 awaitable<typename awaitable<T>::store_type *> awaitable<T>::begin() {
     if (await_ready()) {
-        auto &&val = await_resume();
-        return &val;
+        if (_state == exception) std::rethrow_exception(_exception);
+        return &_value;
     }
     return [frm = read_ptr_frame(this)](awaitable<store_type *>::result r) mutable -> prepared_coro{
         frm.result = r.release();
