@@ -891,6 +891,50 @@ public:
     static typename coroutine<T>::detached_test_awaitable is_detached() {return {};}
 
 
+    ///Retrieve pointer to temporary state
+    /**
+     * Temporary state is a user defined object which is allocated inside of awaitable
+     *  during performing an asynchronous operation. It can be allocated
+     * at the beginning of the asynchronous operation and must be released before the
+     * result is set (or exception);
+     *
+     * This function returns pointer to such temporary state
+     *
+     * @tparam X cast the memory to given type
+     * @param result valid result object
+     * @return if the result variable is not set, return is nullptr. This can happen
+     * if the asynchronous operation is run in detached mode. Otherwise it
+     * returns valid pointer to X.
+     *
+     * @note When called for the first time, returned pointer points to
+     * uninitialized memory. Accessing this object is UB. You need
+     * to start lifetime of this object  by calling std::cosntruct_at.
+     * Don't also forget to destroy this object by calling
+     * std::destroy_at before you set the result.
+     *
+     * @note When called for the first time, it destroys a closure
+     * of the callback function started to initiated asynchronous
+     * function. The destruction is performed by calling
+     * destructor of the closure. Ensure, that your function
+     * no longer need the closure before you call this function.
+     *
+     * @note space reserved for the state is equal to
+     * size of T (result), but never less than
+     * 4x size of pointer. The function checks in compile
+     * time whether the type X fits to the buffer
+     */
+    template<typename X>
+    static X * get_temp_state(awaitable_result<T> &result) {
+        auto me = result._ptr.get();
+        if (!me) return nullptr;
+        static_assert(sizeof(X) <= callback_max_size);
+        if (me->_state != no_value) {
+            me->destroy_state();
+            me->_state = no_value;
+        }
+        return reinterpret_cast<X *>(me->_callback_space);
+    }
+
 protected:
 
     enum State {
@@ -941,7 +985,7 @@ protected:
         Fn _fn;
     };
 
-    static constexpr auto callback_max_size = std::max(sizeof(void *) * 6, sizeof(store_type));
+    static constexpr auto callback_max_size = std::max(sizeof(void *) * 4, sizeof(store_type));
 
     ///current state of object
     State _state = no_value;
@@ -1038,6 +1082,8 @@ protected:
     template<typename _Callback, typename _Allocator>
     prepared_coro set_callback_internal(_Callback &&cb, _Allocator &a);
 
+
+
     template<bool test>
     struct read_state_frame: coro_frame<read_state_frame<test> >{
         awaitable *src;
@@ -1091,30 +1137,13 @@ public:
      * is resumed immediately. You can store result and destroy it
      * later to postpone resumption.
      */
-#if 0
-    prepared_coro operator=(const_reference val) {
-        auto p = _ptr.release();
-        if (p) {
-            p->set_value(val);
-            return p->wakeup();
-        } else {
-            return {};
-        }
-    }
 
-    ///set the result
-    /**
-     * @param val value to set
-     * @return prepared coroutine. If the result is discarded, coroutine
-     * is resumed immediately. You can store result and destroy it
-     * later to postpone resumption.
-     */
-#endif
-    template<std::convertible_to<T> X>
-    prepared_coro operator=(X &&val) {
+    template<typename _Val>
+    requires(std::is_convertible_v<_Val, T> && !std::is_same_v<std::decay_t<_Val>, awaitable_result>)
+    prepared_coro operator=(_Val && val) {
         auto p = _ptr.release();
         if (p) {
-            p->set_value(std::forward<T>(val));
+            p->set_value(std::forward<_Val>(val));
             return p->wakeup();
         } else {
             return {};
@@ -1129,7 +1158,24 @@ public:
      * later to postpone resumption.
      */
     prepared_coro operator=(std::exception_ptr e) {
-        return set_exception(e);
+        auto p = _ptr.release();
+        if (p) {
+            p->set_exception(std::move(e));
+            return p->wakeup();
+        } else {
+            return {};
+        }
+
+    }
+
+    prepared_coro operator=(std::nullopt_t) {
+        auto p = _ptr.release();
+        if (p) {
+            p->drop();
+            return p->wakeup();
+        } else {
+            return {};
+        }
 
     }
 
@@ -1210,6 +1256,8 @@ protected:
         };
     };
     std::unique_ptr<awaitable<T>, deleter> _ptr;
+
+    friend class awaitable<T>;
 };
 
 
@@ -1789,12 +1837,14 @@ protected:
 template<typename T>
 template<bool test>
 void awaitable<T>::read_state_frame<test>::do_resume() {
+           static_assert(std::is_trivially_destructible_v<read_state_frame>);
            bool n = src->_state != no_value;
            awaitable<bool>::result(this->result)(n == test);
 }
 
 template<typename T>
 void awaitable<T>::read_ptr_frame::do_resume() {
+    static_assert(std::is_trivially_destructible_v<read_ptr_frame>);
     typename awaitable<store_type *>::result r(this->result);
     if (src->_state == value) {
         r(&src->_value);
@@ -1808,20 +1858,24 @@ void awaitable<T>::read_ptr_frame::do_resume() {
 template<typename T>
 awaitable<bool> awaitable<T>::operator!()  {
     if (await_ready()) {return _state == no_value;}
-    return [frm = read_state_frame<false>(this)](awaitable<bool>::result r) mutable -> prepared_coro {
-        frm.result = r.release();
-        if (!frm.result) return {};
-        return frm.src->await_suspend(frm.get_handle());
+    return [this](awaitable<bool>::result r) mutable -> prepared_coro {
+        auto frm =awaitable<bool>::get_temp_state<read_state_frame<false> >(r);
+        if (!frm) return {};
+        std::construct_at(frm, this);
+        frm->result = r.release();
+        return frm->src->await_suspend(frm->get_handle());
     };
 
 }
 template<typename T>
 awaitable<bool> awaitable<T>::has_value() {
     if (await_ready()) {return _state != no_value;}
-    return [frm = read_state_frame<true>(this)](awaitable<bool>::result r) mutable -> prepared_coro {
-        frm.result = r.release();
-        if (!frm.result) return {};
-        return frm.src->await_suspend(frm.get_handle());
+    return [this](awaitable<bool>::result r) mutable -> prepared_coro {
+        auto frm =awaitable<bool>::get_temp_state<read_state_frame<true> >(r);
+        if (!frm) return {};
+        std::construct_at(frm, this);
+        frm->result = r.release();
+        return frm->src->await_suspend(frm->get_handle());
     };
 }
 
@@ -1831,10 +1885,12 @@ awaitable<typename awaitable<T>::store_type *> awaitable<T>::begin() {
         if (_state == exception) std::rethrow_exception(_exception);
         return &_value;
     }
-    return [frm = read_ptr_frame(this)](awaitable<store_type *>::result r) mutable -> prepared_coro{
-        frm.result = r.release();
-        if (!frm.result) return {};
-        return frm.src->await_suspend(frm.get_handle());
+    return [this](awaitable<store_type *>::result r) mutable -> prepared_coro{
+        auto frm = awaitable<store_type* >::template get_temp_state<read_ptr_frame>(r);
+        if (!frm) return {};
+        std::construct_at(frm, this);
+        frm->result = r.release();
+        return frm->src->await_suspend(frm->get_handle());
     };
 }
 

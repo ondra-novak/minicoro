@@ -102,12 +102,19 @@ public:
         //if success, return it directly
         if (test) return test;
         //otherwise create slot and add self to waiting queue
-        return [s = slot(), this](awaitable<ownership>::result r) mutable {
-            if (!r) return prepared_coro{};
+        return [this](awaitable<ownership>::result r) mutable {
+            //retrieve temp state
+            auto s = awaitable<ownership>::get_temp_state<slot>(r);
+            //is temp state is not available, exit (detached)
+            if (!s) return prepared_coro{};
+            //copy this (will be destroyed)
+            auto me = this;
+            //zero next
+            s->_next = nullptr;
             //retrieve awaitable as pointer
-            s._resume = r.release();
+            s->_resume = r.release();
             //add slot as request
-            return add_request(&s);
+            return me->add_request(s);
         };
     }
 
