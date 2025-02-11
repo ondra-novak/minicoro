@@ -3,6 +3,7 @@
 #include "../coro_mutex.h"
 #include "../coro_queue.h"
 #include "../coro_distributor.h"
+#include "../coro_scheduler.h"
 #include <iostream>
 
 

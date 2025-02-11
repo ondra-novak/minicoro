@@ -101,11 +101,14 @@ public:
         prepared_coro resm;
         std::lock_guard _(_mx);
         if (_queue.is_full()) {
-            return [this,slot = slot<val_and_result>(std::forward<Args>(args)...)]
-                    (awaitable<void>::result r) mutable {
+            return [this](awaitable<void>::result r) mutable {
+                auto _this = this;
+                using Slot = slot<typename awaitable<val_and_result>::result>;
+                auto s = awaitable<void>::template get_temp_state<Slot>(r);
+                std::construct_at(&s);
                 if (!r) return;
-                slot.payload.res =std::move(r);
-                _push_queue.push(&slot);
+                s.payload.res =std::move(r);
+                _this->_push_queue.push(&s);;
             };
         } else if (_queue.is_empty()) {
             auto slot = _pop_queue.pop();
@@ -128,15 +131,18 @@ public:
         prepared_coro resm;
         std::lock_guard _(_mx);
         if (_queue.is_empty()) {
-            return [this, slot = slot<typename awaitable<value_type>::result>({})]
-                    (typename awaitable<value_type>::result r) mutable {
+            return [this](typename awaitable<value_type>::result r) mutable {
+                auto _this = this;
+                using Slot = slot<typename awaitable<value_type>::result>;
+                auto s = awaitable<value_type>::template get_temp_state<Slot>(r);
+                std::construct_at(&s);
              if (!r) return;
-             if (_closed) {
-                 r =  _closed;
+             if (_this->_closed) {
+                 r =  _this->_closed;
                  return;
              }
-             slot.payload = std::move(r);
-             _pop_queue.push(&slot);
+             s.payload = std::move(r);
+             _this->_pop_queue.push(&s);
             };
         } else {
             return pop2(resm);
