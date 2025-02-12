@@ -77,7 +77,7 @@ protected:
  * @tparam Queue_Impl implementation of the queue = example limited_queue
  * @tparam Lock object to lock internals
  */
-template<typename Queue_Impl, typename Lock = std::mutex>
+template<typename Queue_Impl, basic_lockable Lock = empty_lockable>
 class coro_basic_queue {
 public:
 

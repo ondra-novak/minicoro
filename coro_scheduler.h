@@ -1,6 +1,7 @@
 #pragma once
 
 #include "coroutine.h"
+#include "alert_flag.h"
 
 #include <algorithm>
 #include <mutex>
@@ -25,9 +26,6 @@ protected:
 template<typename T, typename _TP, typename _Ident = const void *>
 class generic_scheduler {
 public:
-
-
-
 
     void schedule_at(T x, _TP timestamp, _Ident ident) {
         _heap.push_back({timestamp, std::move(x), ident});
@@ -135,6 +133,129 @@ protected:
     }
 };
 
+
+template<typename _TP = std::chrono::system_clock::time_point>
+class manual_scheduler {
+public:
+    using _Ident = const void *;
+    using result_object = awaitable<void>::result;
+
+    awaitable<void> sleep_until(_TP tp, _Ident ident = {}) {
+        return [this,tp=std::move(tp),ident](result_object r) mutable {
+            _sch.schedule_at(std::move(r), std::move(tp), ident);
+        };
+    }
+    awaitable<void> sleep_until_alertable(alert_flag_type alert_flag, _TP tp) {
+        return [this,tp=std::move(tp),&alert_flag](result_object r) mutable -> prepared_coro {
+            if (alert_flag) return r();
+            _sch.schedule_at(std::move(r), std::move(tp), &alert_flag);
+            return prepared_coro();
+        };
+    }
+
+    template<typename Dur>
+    requires(requires(_TP tp, Dur dur){{tp+dur}->std::convertible_to<_TP>;})
+    awaitable<void> sleep_for(Dur dur, _Ident ident = {}) {
+        return sleep_until(get_current_time() + dur, ident);
+    }
+    template<typename Dur>
+    requires(requires(_TP tp, Dur dur){{tp+dur}->std::convertible_to<_TP>;})
+    awaitable<void> sleep_for_alertable(alert_flag_type &alert_flag, Dur dur) {
+        return sleep_until_alertable(alert_flag,  get_current_time()+dur);
+    }
+    ///retrive first scheduled time
+    std::optional<std::chrono::system_clock::time_point> get_first_scheduled_time() const {
+        return _sch.get_first_scheduled_time();
+    }
+    ///remove first scheduled coroutine
+    /**
+     * @return result object of this coroutine, or empty if none
+     */
+    result_object remove_first() {
+        return _sch.remove_first();
+    }
+    ///remove sleeping coroutine by identity
+    /**
+     * @param ident identity
+     * @return result object of this coroutine, or empty, if not found
+     */
+    result_object remove_by_ident(_Ident ident) {
+        return _sch.remove_by_ident(ident);
+    }
+    ///cancel sleep
+    /** cancels sleep and resolves awaitable with given value
+     *
+     * @param ident identity
+     * @param arg value
+     * @return prepared coroutine. If empty, then nothing has been canceled
+     */
+
+     template<std::convertible_to<void> Arg>
+     prepared_coro cancel(_Ident ident, Arg &&arg) {
+         result_object r = remove_by_ident(ident);
+         return r(std::forward<Arg>(arg));
+     }
+     ///cancel sleep with exception
+     /** cancels sleep and resolves awaitable with exception
+      *
+      * @param ident identity
+      * @param e exception
+      * @return prepared coroutine. If empty, then nothing has been canceled
+      */
+ 
+     prepared_coro cancel(_Ident ident, std::exception_ptr e) {
+         result_object r = remove_by_ident(ident);
+         return r = e;
+     }
+     ///cancel sleep with exception
+     /** cancels sleep and resolves awaitable with no-value
+      *
+      * @param ident identity
+      * @return prepared coroutine. If empty, then nothing has been canceled
+      */
+     prepared_coro cancel(_Ident ident) {
+         result_object r = remove_by_ident(ident);
+         return r = std::nullopt;
+     }
+     ///send alert to alertable sleeping coroutine and wake it up
+     /**
+      * @param ident identity of sleeping coroutine
+      * @param alert_flag reference to a shared flag, which serves as alert notification. The
+      * function sets this flag to true
+      *
+      * if the coroutine is not sleeping, it will not sleep until the flag is cleared. If the
+      * coroutine is sleeping, it is waken up immediately. Note that the coroutine is still
+      * executed by the scheduler (in this thread)
+      */
+     void alert(alert_flag_type &alert_flag) {     
+         alert_flag.set();
+         _sch.set_time(&alert_flag, std::chrono::system_clock::now());
+     }
+
+     ///retrieves current time
+     /**
+      * @return current simmulation time
+      */
+     _TP get_current_time() const {return _current_time;}
+
+     ///advances time until givne time point
+     /** If there is scheduled coroutine, it removes it and returns it
+      * to be resumed. The current time is set to time where coroutine was scheduled
+      * If there is no coroutine before given target_time, returns empty object
+      */
+     prepared_coro advance_time_until(_TP target_time) {
+        _TP n = _sch.get_first_scheduled_time();
+        if (n>target_time) return {};
+        _current_time = n;
+        result_object r = _sch.remove_first();
+        return r();
+     }
+ 
+protected:
+    _TP _current_time = {};
+    generic_scheduler<result_object, std::chrono::system_clock::time_point,_Ident> _sch;
+};
+
 class scheduler {
 public:
 
@@ -165,15 +286,15 @@ public:
      *
      * @see alert
      */
-    awaitable<void> sleep_until_alertable(std::atomic<bool> &alert_flag, std::chrono::system_clock::time_point tp) {
-        return [this, tp, &alert_flag](result_object r) mutable {
+    awaitable<void> sleep_until_alertable(alert_flag_type &alert_flag, std::chrono::system_clock::time_point tp) {
+        return [this, tp, &alert_flag](result_object r) mutable -> prepared_coro {
             std::lock_guard _(_mx);
-            if (alert_flag.load(std::memory_order_relaxed)) {
-                r();
-                return;
+            if (alert_flag) {
+                return r();
             }
             if (tp < _sch.get_first_scheduled_time()) _cv.notify_all();
             _sch.schedule_at(std::move(r),std::move(tp),&alert_flag);
+            return prepared_coro{};
         };
     }
 
@@ -201,7 +322,7 @@ public:
      * @see alert
      */
     template<typename A, typename B>
-    awaitable<void> sleep_for_alertable(std::atomic<bool> &alert_flag, std::chrono::duration<A,B> dur) {
+    awaitable<void> sleep_for_alertable(alert_flag_type &alert_flag, std::chrono::duration<A,B> dur) {
         return sleep_until_alertable(alert_flag,  std::chrono::system_clock::now()+dur);
     }
 
@@ -349,9 +470,9 @@ public:
      * coroutine is sleeping, it is waken up immediately. Note that the coroutine is still
      * executed by the scheduler (in this thread)
      */
-    void alert(std::atomic<bool> &alert_flag) {
+    void alert(alert_flag_type &alert_flag) {
         std::lock_guard _(_mx);
-        alert_flag.store(true, std::memory_order_relaxed);
+        alert_flag.set();
         _sch.set_time(&alert_flag, std::chrono::system_clock::now());
         _cv.notify_all();
     }

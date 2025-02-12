@@ -1,14 +1,13 @@
 #pragma once
 
 #include "coroutine.h"
-#include <mutex>
 #include <vector>
 #include <algorithm>
 
 namespace MINICORO_NAMESPACE {
 
 
-template<typename T, typename Lock = std::mutex>
+template<typename T, basic_lockable Lock = empty_lockable>
 class distributor {
 public:
     using value_type = T;
@@ -30,7 +29,7 @@ public:
      */
     awaitable operator()(ident id = {}) {
         return [this,id](result_object r){
-            std::lock_guard _(_mx);
+            lock_guard _(_mx);
             _results.push_back({std::move(r), id});
         };
     }
@@ -44,7 +43,7 @@ public:
      */
     awaitable operator()(std::atomic<bool> &alert_flag) {
         return [this,&alert_flag](result_object r){
-            std::lock_guard _(_mx);
+            lock_guard _(_mx);
             if (alert_flag.load(std::memory_order_relaxed)) return;
             _results.push_back({std::move(r), &alert_flag});
         };
@@ -62,7 +61,7 @@ public:
     template<typename ... Args>
     requires(std::is_constructible_v<value_type, Args...>)
     void broadcast(prepared &buffer, Args && ... args) {
-        std::lock_guard _(_mx);
+        lock_guard _(_mx);
         for (auto &r: _results) {
             buffer.push_back(r.r(args...));
         }
@@ -94,7 +93,7 @@ public:
      */
     template<std::invocable<result_object> Resolver>
     prepared_coro kick_out(ident id, Resolver &&resolver) {
-        std::lock_guard _(_mx);
+        lock_guard _(_mx);
         prepared_coro out;
         auto iter = std::find_if(_results.begin(), _results.end(), [&](const awaiting_info &x){
             return x.i == id;
@@ -149,7 +148,7 @@ public:
      */
     prepared_coro alert(std::atomic<bool> &alert_flag) {
         prepared_coro out;
-        std::lock_guard _(_mx);
+        lock_guard _(_mx);
         alert_flag.store(true, std::memory_order_relaxed);
         auto iter = std::find_if(_results.begin(), _results.end(), [&](const awaiting_info &x){
             return x.i == &alert_flag;

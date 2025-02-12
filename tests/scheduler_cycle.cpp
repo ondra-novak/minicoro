@@ -8,9 +8,9 @@
 using namespace minicoro;
 
 
-awaitable<int> cycle_coro(scheduler &sch, std::atomic<bool> &flag) {
+awaitable<int> cycle_coro(scheduler &sch, alert_flag_type &flag) {
     int count_cycles = 0;
-    while (!flag.load(std::memory_order_relaxed)) {
+    while (!flag.test_and_reset()) {
         count_cycles++;
         co_await sch.sleep_for_alertable(flag, std::chrono::milliseconds(100));
         co_await sch.sleep_for(std::chrono::milliseconds(100));
@@ -20,7 +20,7 @@ awaitable<int> cycle_coro(scheduler &sch, std::atomic<bool> &flag) {
 
 
 awaitable<int> main_coro(scheduler &sch, std::chrono::milliseconds ms) {
-    std::atomic<bool> flag= {false};
+    alert_flag_type flag;
 
     awaitable<int> c = cycle_coro(sch, flag);
     anyof_set s;

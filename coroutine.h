@@ -100,7 +100,6 @@ OTHER DEALINGS IN THE SOFTWARE.
 #include <optional>
 #include <span>
 #include <atomic>
-#include <new>
 
 #ifndef MINICORO_NAMESPACE
 #define MINICORO_NAMESPACE minicoro
@@ -1419,43 +1418,6 @@ inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Alloca
 }
 
 
-///a emulation of coroutine which sets atomic flag when it is resumed
-class sync_frame : public coro_frame<sync_frame> {
-public:
-
-    sync_frame() = default;
-    sync_frame (const sync_frame  &) = delete;
-    sync_frame &operator = (const sync_frame  &) = delete;
-
-    ///wait for synchronization
-    void wait() {
-        _signal.wait(false);
-    }
-
-    ///reset synchronization
-    void reset() {
-        _signal = false;
-    }
-
-protected:
-    friend class coro_frame<sync_frame>;
-    std::atomic<bool> _signal = {};
-    void do_resume() {
-        _signal = true;
-        _signal.notify_all();
-    }
-
-};
-
-template<typename T>
-inline void awaitable<T>::wait() {
-    if (!await_ready()) {
-        sync_frame sync;
-        await_suspend(sync.get_handle()).resume();
-        sync.wait();
-    }
-}
-
 
 
 template<typename T>
@@ -1841,66 +1803,6 @@ concept can_be_unlocked = requires(T v) {
     {v.unlock()};
 };
 
-class empty_lockable {
-public:
-    void lock() {};
-    void unlock() {};
-    bool try_lock() {return true;}
-};
-
-///helps to unlock a mutex during suspended operation.
-/**
- * @code
- * std::unique_lock lock(mx);
- * int result = co_await unlock_on_suspend(get_async_result(), lock);
- * @endcode
- *
- * @tparam _Awt an awaiter which is monitored
- * @tparam _Lock lock object which is controlled, expected std::unique_lock
- *
- * The awaiter monitors other awaiter. If the awaiter enters to await_suspend, it
- * performs to unlock of the mutex as the very last action of suspend operation.
- * The lock is acquired back before resume, so the code continues with locked owned
- *
- * @note the object need owned lock, otherwise it throws an exception
- *
- */
-template<typename _Awt, typename _Lock>
-class unlock_on_suspend {
-public:
-    unlock_on_suspend(_Awt &&awt, _Lock &lock):_awt(awt), _lock(lock) {
-        check_lock();
-    }
-    bool await_ready() {return _awt.await_ready();}
-    decltype(auto) await_suspend(std::coroutine_handle<> h) {
-        check_lock();
-        //release mutex - we will unlock it later
-        auto raw_mutex = _lock.release();
-        //consider mutex is no longer owned by this thread,
-        //construct lock defering lock operation
-        _lock = _Lock(raw_mutex,std::defer_lock);
-        //define call, which unlocks the mutex after suspend
-        auto unlock = on_destroy([&]{
-            //unlock, when suspend is done
-            raw_mutex.unlock();
-        });
-        //forward to awaiter
-        return _awt.await_suspend(h);
-    }
-    decltype(auto) await_resume() {
-        //if lock is not owner, we returning from suspend
-        //so acquire lock now - so it will look unchanged during operation
-        if (!_lock) _lock.lock();
-        return _awt.await_resume();
-    }
-protected:
-    _Awt &&_awt;
-    _Lock &&_lock;
-    void check_lock() {
-        if (!_lock) throw std::invalid_argument("unlock_on_suspend: the lock is not owned");
-    }
-};
-
 
 
 template<typename T>
@@ -1980,4 +1882,67 @@ prepared_coro call_await_resume(_Awt &&awt, std::coroutine_handle<> handle) {
     }
 }
 
+template<typename T>
+concept basic_lockable = requires(T v) {
+    {v.lock()};
+    {v.unlock()};
+};
+
+class empty_lockable {
+public:
+    void lock() {};
+    void unlock() {};
+    bool try_lock() {return true;}
+};
+
+template<basic_lockable _LK>
+class lock_guard {
+public:
+    lock_guard(_LK &lk):_lk(lk) {_lk.lock();}
+    ~lock_guard() {_lk.unlock();}
+    lock_guard(const lock_guard &) = delete;
+    lock_guard &operator=(const lock_guard &) = delete;
+
+protected:
+    _LK &_lk;
+
+};
+
+    
+///a emulation of coroutine which sets atomic flag when it is resumed
+class sync_frame : public coro_frame<sync_frame> {
+    public:
+    
+        sync_frame() = default;
+        sync_frame (const sync_frame  &) = delete;
+        sync_frame &operator = (const sync_frame  &) = delete;
+    
+        ///wait for synchronization
+        void wait() {
+            _signal.wait(false);
+        }
+    
+        ///reset synchronization
+        void reset() {
+            _signal = false;
+        }
+    
+    protected:
+        friend class coro_frame<sync_frame>;
+        std::atomic<bool> _signal = {};
+        void do_resume() {
+            _signal = true;
+            _signal.notify_all();
+        }
+    
+    };
+    
+    template<typename T>
+    inline void awaitable<T>::wait() {
+        if (!await_ready()) {
+            sync_frame sync;
+            await_suspend(sync.get_handle()).resume();
+            sync.wait();
+        }
+    }  
 }
