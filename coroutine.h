@@ -1883,7 +1883,7 @@ public:
             raw_mutex.unlock();
         });
         //forward to awaiter
-        return _awt.await_suspend();
+        return _awt.await_suspend(h);
     }
     decltype(auto) await_resume() {
         //if lock is not owner, we returning from suspend

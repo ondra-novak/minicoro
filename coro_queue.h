@@ -149,6 +149,7 @@ public:
         }
     }
 
+
     ///clear whole queue. The function also resumes all stuck producers
     void clear() {
         while (pop().is_ready());
@@ -192,6 +193,8 @@ protected:
 
         slot(_Payload p):payload(p) {}
     };
+
+    
 
     struct val_and_result {
         value_type val;

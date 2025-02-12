@@ -54,6 +54,18 @@ public:
         return r;
     }
 
+    ///set task time, update its position in the heap
+    bool set_time(_Ident ident, _TP new_tp) {
+        for (std::size_t i = 0, cnt = _heap.size();i<cnt; ++i) {
+            if (_heap[i].ident == ident) {
+                auto r=std::move(_heap[i].res);
+                update_heap_element(i, {new_tp, std::move(r), ident});
+                return true;
+            }
+        }
+        return false;
+    }
+
 
 protected:
 
@@ -71,13 +83,13 @@ protected:
 
 
     void update_heap_element(std::size_t pos, HeapItem &&new_value) {
-        bool shift_up = comp(_heap[pos], new_value);
+        bool shift_up = compare(_heap[pos], new_value);
         _heap[pos] = std::move(new_value);
 
         if (shift_up) {
             while (pos > 0) {
                 size_t parent = (pos - 1) / 2;
-                if (comp(_heap[parent], _heap[pos])) {
+                if (compare(_heap[parent], _heap[pos])) {
                     std::swap(_heap[parent], _heap[pos]);
                     pos = parent;
                 } else {
@@ -92,10 +104,10 @@ protected:
                 size_t right = 2 * pos + 2;
                 size_t largest = pos;
 
-                if (left < n && comp(_heap[largest], _heap[left])) {
+                if (left < n && compare(_heap[largest], _heap[left])) {
                     largest = left;
                 }
-                if (right < n && comp(_heap[largest], _heap[right])) {
+                if (right < n && compare(_heap[largest], _heap[right])) {
                     largest = right;
                 }
                 if (largest != pos) {
@@ -128,6 +140,31 @@ public:
             _sch.schedule_at(std::move(r),std::move(tp),std::move(ident));
         };
     }
+
+    ///sleep coroutine but enable alert() feature
+    /**
+     * @param alert_flag a reference to flag which must be set to true for alert. If this flag is
+     * set, the sleep immediately returns, because there is an active alert. If this flag is false,
+     * sleep_until function performs sleep as normal
+     * @param tp time point when sleep is waken up
+     * @param ident identity of the coroutine. This field is mandatory (otherwise alert() can't work). This
+     * value must be unique.
+     * @return awaitable object
+     * 
+     * @see alert
+     */
+    awaitable<_Value> sleep_until_alertable(std::atomic<bool> &alert_flag, std::chrono::system_clock::time_point tp, _Ident ident) {
+        return [this, tp, ident = std::move(ident), &alert_flag](result_object r) mutable {
+            std::lock_guard _(_mx);
+            if (alert_flag.load(std::memory_order_relaxed)) {
+                r();
+                return;
+            }
+            if (tp < _sch.get_first_scheduled_time()) _cv.notify_all();
+            _sch.schedule_at(std::move(r),std::move(tp),std::move(ident));
+        };
+    }
+
     ///sleep for given time
     /**
      * @param dur duration
@@ -137,6 +174,23 @@ public:
     template<typename A, typename B>
     awaitable<_Value> sleep_for(std::chrono::duration<A,B> dur, _Ident ident = {}) {
         return sleep_until(std::chrono::system_clock::now()+dur, std::move(ident));
+    }
+
+    ///sleep coroutine but enable alert() feature
+    /**
+     * @param alert_flag a reference to flag which must be set to true for alert. If this flag is
+     * set, the sleep immediately returns, because there is an active alert. If this flag is false,
+     * sleep_until function performs sleep as normal
+     * @param duration time duration
+     * @param ident identity of the coroutine. This field is mandatory (otherwise alert() can't work). This
+     * value must be unique.
+     * @return awaitable object
+     * 
+     * @see alert
+     */
+    template<typename A, typename B>
+    awaitable<_Value> sleep_for_alertable(std::atomic<bool> &alert_flag, std::chrono::duration<A,B> dur, _Ident ident) {
+        return sleep_until_alertable(alert_flag,  std::chrono::system_clock::now()+dur, std::move(ident));
     }
 
     ///retrive first scheduled time
@@ -254,7 +308,22 @@ public:
         result_object r = remove_by_ident(ident);
         return r = std::nullopt;
     }
-
+    ///send alert to alertable sleeping coroutine and wake it up
+    /**
+     * @param ident identity of sleeping coroutine
+     * @param alert_flag reference to a shared flag, which serves as alert notification. The
+     * function sets this flag to true
+     * 
+     * if the coroutine is not sleeping, it will not sleep until the flag is cleared. If the
+     * coroutine is sleeping, it is waken up immediately. Note that the coroutine is still 
+     * executed by the scheduler (in this thread)
+     */
+    void alert(_Ident ident, std::atomic<bool> &alert_flag) {
+        std::lock_guard _(_mx);
+        alert_flag.store(true, std::memory_order_relaxed);
+        _sch.set_time(ident, std::chrono::system_clock::now());
+        _cv.notify_all();        
+    }
 
 protected:
     mutable std::mutex _mx;
