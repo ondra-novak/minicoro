@@ -12,7 +12,7 @@ template class minicoro::coro_queue<int, 128>;
 template class minicoro::multi_lock<10>;
 template class minicoro::awaitable<const int &>;
 template class minicoro::distributor<const int>;
-template class minicoro::scheduler<>;
+
 
 int main() {
     std::cout << sizeof(minicoro::awaitable<int>) << std::endl;

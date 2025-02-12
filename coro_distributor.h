@@ -39,15 +39,14 @@ public:
     /**
      * @param alert_flag reference to alert flag. This must be set to false to register. If
      * it is set to true, the co_await immediately returns
-     * @param id identity of coroutine, must be unique
-     * 
+     *
      * @see alert
      */
-    awaitable operator()(std::atomic<bool> &alert_flag, ident id) {
-        return [this,id,&alert_flag](result_object r){
+    awaitable operator()(std::atomic<bool> &alert_flag) {
+        return [this,&alert_flag](result_object r){
             std::lock_guard _(_mx);
             if (alert_flag.load(std::memory_order_relaxed)) return;
-            _results.push_back({std::move(r), id});
+            _results.push_back({std::move(r), &alert_flag});
         };
     }
 
@@ -139,16 +138,16 @@ public:
      * is removed
      * @return prepared coro object. It is filled when registered coroutine was removed. You
      * need to resume it (just drop the object) to give coroutine chance to process
-     * this situation. The coroutine can check shared flag. 
-     * 
+     * this situation. The coroutine can check shared flag.
+     *
      * @note the co_await always throws exception await_canceled_exception.
      */
-    prepared_coro alert(std::atomic<bool> &alert_flag,ident id) {
+    prepared_coro alert(std::atomic<bool> &alert_flag) {
         prepared_coro out;
         std::lock_guard _(_mx);
         alert_flag.store(true, std::memory_order_relaxed);
         auto iter = std::find_if(_results.begin(), _results.end(), [&](const awaiting_info &x){
-            return x.i == id;
+            return x.i == &alert_flag;
         });
         if (iter != _results.end()) {
             out = iter->r = std::nullopt;
@@ -156,7 +155,7 @@ public:
             auto last = _results.end();
             --last;
             if (iter != last) std::swap(*iter, *last);
-            _results.pop_back();   
+            _results.pop_back();
         }
         return out;
 
