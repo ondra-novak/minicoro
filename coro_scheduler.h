@@ -56,14 +56,15 @@ public:
 
     ///set task time, update its position in the heap
     bool set_time(_Ident ident, _TP new_tp) {
+        bool ok = false;
         for (std::size_t i = 0, cnt = _heap.size();i<cnt; ++i) {
             if (_heap[i].ident == ident) {
                 auto r=std::move(_heap[i].res);
                 update_heap_element(i, {new_tp, std::move(r), ident});
-                return true;
+                ok = true;
             }
         }
-        return false;
+        return ok;
     }
 
 
