@@ -100,6 +100,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 #include <optional>
 #include <span>
 #include <atomic>
+#include <new>
 
 #ifndef MINICORO_NAMESPACE
 #define MINICORO_NAMESPACE minicoro
@@ -1052,10 +1053,11 @@ protected:
         destroy_state();
         try {
             _state = value;
+            void *trg = const_cast<std::remove_const_t<store_type> *>(&_value);
             if constexpr (sizeof...(Args) == 1 && (std::is_invocable_r_v<store_type, Args>  && ...)) {
-                new(&_value) store_type((...,args()));
+                new(trg) store_type((...,args()));
             } else {
-                new(&_value) store_type(std::forward<Args>(args)...);
+                new(trg) store_type(std::forward<Args>(args)...);
             }
         } catch (...) {
             _state = exception;
@@ -1961,5 +1963,21 @@ awaitable<typename awaitable<T>::store_type *> awaitable<T>::begin() {
     };
 }
 
+template<typename _Awt>
+prepared_coro call_await_resume(_Awt &&awt, std::coroutine_handle<> handle) {
+    using Ret = decltype(awt.await_suspend(handle));
+    static_assert(std::is_void_v<Ret>
+                || std::is_convertible_v<Ret, std::coroutine_handle<> >
+                || std::is_convertible_v<Ret, bool>);
+
+    if constexpr(std::is_convertible_v<Ret, std::coroutine_handle<> >) {
+        return prepared_coro(awt.await_suspend(handle));
+    } else if constexpr(std::is_convertible_v<Ret, bool>) {
+        bool b = awt.await_suspend(handle);
+        return b?prepared_coro():prepared_coro(handle);
+    } else {
+        return {};
+    }
+}
 
 }

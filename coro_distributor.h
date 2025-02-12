@@ -11,7 +11,7 @@ namespace MINICORO_NAMESPACE {
 template<typename T, typename Lock = std::mutex>
 class distributor {
 public:
-    using value_type = std::add_lvalue_reference<T>;
+    using value_type = T;
 
     using awaitable = MINICORO_NAMESPACE::awaitable<value_type>;
     using result_object = typename awaitable::result;
@@ -52,18 +52,21 @@ public:
 
     ///broadcast the value
     /**
-     * @param v value to broadcast
      * @param buffer (preallocated) buffer to store prepared_coroutines. You
      * need to clear the buffer to resume all these coroutines. You can
      * use thread pool to enqueue coroutines to run
+     * @params args arguments need to construct value
      *
      * @note This function is MT-Safe if the Lock is std::mutex
      */
-    void broadcast(value_type v, prepared &buffer) {
+    template<typename ... Args>
+    requires(std::is_constructible_v<value_type, Args...>)
+    void broadcast(prepared &buffer, Args && ... args) {
         std::lock_guard _(_mx);
         for (auto &r: _results) {
-            buffer.push_back(r.r(v));
+            buffer.push_back(r.r(args...));
         }
+        _results.clear();
     }
 
     ///broadcast the value and resume awaiting coroutines in current thread
@@ -73,8 +76,10 @@ public:
      * thread can call broadcast() at the same time. For other functions
      * this function is MT-Safe.
      */
-    void broadcast(value_type v) {
-        broadcast(v, _ready_to_run);
+    template<typename ... Args>
+    requires(std::is_constructible_v<value_type, Args...>)
+    void broadcast(Args && ... args) {
+        broadcast(_ready_to_run, std::forward<Args>(args)...);
         _ready_to_run.clear();
     }
 
@@ -150,7 +155,7 @@ public:
             return x.i == &alert_flag;
         });
         if (iter != _results.end()) {
-            out = iter->r = std::nullopt;
+            out = (iter->r = std::nullopt);
 
             auto last = _results.end();
             --last;

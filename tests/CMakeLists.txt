@@ -1,10 +1,13 @@
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/)
 
-set(testFiles all_compile.cpp 
+set(testFiles all_compile.cpp
               coro_and_awaiter.cpp
               anyof_allof.cpp
               generator.cpp
               mutex.cpp
+              distributor.cpp
+              scheduler.cpp
+              scheduler_cycle.cpp
               )
 
 foreach (testFile ${testFiles})

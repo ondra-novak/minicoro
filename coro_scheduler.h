@@ -2,12 +2,25 @@
 
 #include "coroutine.h"
 
+#include <algorithm>
 #include <mutex>
 #include <optional>
 #include <condition_variable>
 #include <vector>
 #include <thread>
 namespace MINICORO_NAMESPACE {
+
+class stop_source_coro_frame: public coro_frame<stop_source_coro_frame>,
+                              public std::stop_source {
+public:
+
+protected:
+    friend class coro_frame<stop_source_coro_frame>;
+    void do_resume() {
+        this->request_stop();
+    }
+};
+
 
 template<typename T, typename _TP, typename _Ident = const void *>
 class generic_scheduler {
@@ -230,7 +243,7 @@ public:
             if (tm) {
                 auto now =std::chrono::system_clock::now();
                 if (now > *tm) {
-                    auto r = remove_first();
+                    auto r = _sch.remove_first();
                     lk.unlock();
                     executor(r);
                     lk.lock();
@@ -248,6 +261,25 @@ public:
      */
     void run_thread(std::stop_token tkn) {
         run_thread([](auto &&x){x();}, std::move(tkn));
+    }
+
+    ///run scheduler while awaiting for given awaiter
+    /**
+     * @param awt coroutine's compatibile awaiter (must have await_ready, await_suspend and await_resume)
+     * @return value returned by await_resume()
+     *
+     * function similar as co_await, however runs scheduler while awaiting
+     */
+    template<typename Awt>
+    decltype(auto) await(Awt &&awt) {
+
+        if (!awt.await_ready()) {
+            stop_source_coro_frame stpsrc;
+            call_await_resume(std::forward<Awt>(awt), stpsrc.get_handle());
+            run_thread(stpsrc.get_token());
+        }
+        return awt.await_resume();
+
     }
 
     ///create thread and run scheduler
