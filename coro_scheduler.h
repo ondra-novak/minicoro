@@ -78,6 +78,9 @@ public:
         return ok;
     }
 
+    bool empty() const {
+        return _heap.empty();
+    }
 
 protected:
 
@@ -202,7 +205,7 @@ public:
       * @param e exception
       * @return prepared coroutine. If empty, then nothing has been canceled
       */
- 
+
      prepared_coro cancel(_Ident ident, std::exception_ptr e) {
          result_object r = remove_by_ident(ident);
          return r = e;
@@ -227,7 +230,7 @@ public:
       * coroutine is sleeping, it is waken up immediately. Note that the coroutine is still
       * executed by the scheduler (in this thread)
       */
-     void alert(alert_flag_type &alert_flag) {     
+     void alert(alert_flag_type &alert_flag) {
          alert_flag.set();
          _sch.set_time(&alert_flag, std::chrono::system_clock::now());
      }
@@ -245,12 +248,12 @@ public:
       */
      prepared_coro advance_time_until(_TP target_time) {
         _TP n = _sch.get_first_scheduled_time();
-        if (n>target_time) return {};
-        _current_time = n;
+        if (!n || *n>target_time) return {};
+        _current_time = std::max(target_time,n);
         result_object r = _sch.remove_first();
         return r();
      }
- 
+
 protected:
     _TP _current_time = {};
     generic_scheduler<result_object, std::chrono::system_clock::time_point,_Ident> _sch;
@@ -271,7 +274,8 @@ public:
     awaitable<void> sleep_until(std::chrono::system_clock::time_point tp, _Ident ident = {}) {
         return [this, tp, ident = std::move(ident)](result_object r) mutable {
             std::lock_guard _(_mx);
-            if (tp < _sch.get_first_scheduled_time()) _cv.notify_all();
+            auto n = _sch.get_first_scheduled_time();
+            if (!n || tp < *n) _cv.notify_all();
             _sch.schedule_at(std::move(r),std::move(tp),std::move(ident));
         };
     }

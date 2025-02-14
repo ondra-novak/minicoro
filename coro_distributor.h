@@ -10,9 +10,9 @@ namespace MINICORO_NAMESPACE {
 template<typename T, basic_lockable Lock = empty_lockable>
 class distributor {
 public:
-    using value_type = T;
+    using value_type = voidless_type<T>;
 
-    using awaitable = MINICORO_NAMESPACE::awaitable<value_type>;
+    using awaitable = MINICORO_NAMESPACE::awaitable<T>;
     using result_object = typename awaitable::result;
     using prepared = std::vector<prepared_coro>;
     using ident = const void *;
@@ -29,8 +29,7 @@ public:
      */
     awaitable operator()(ident id = {}) {
         return [this,id](result_object r){
-            lock_guard _(_mx);
-            _results.push_back({std::move(r), id});
+            add_listener(std::move(r), id);
         };
     }
 
@@ -41,12 +40,22 @@ public:
      *
      * @see alert
      */
-    awaitable operator()(std::atomic<bool> &alert_flag) {
+    awaitable operator()(alert_flag_type &alert_flag) {
         return [this,&alert_flag](result_object r){
-            lock_guard _(_mx);
-            if (alert_flag.load(std::memory_order_relaxed)) return;
-            _results.push_back({std::move(r), &alert_flag});
+            add_listener(alert_flag, std::move(r));
         };
+    }
+
+    void add_listener(result_object r, ident id = {}) {
+        lock_guard _(_mx);
+        _results.push_back({std::move(r), id});
+
+    }
+    void add_listener(alert_flag_type a, result_object r) {
+        lock_guard _(_mx);
+        if (a) return;
+        _results.push_back({std::move(r), &a});
+
     }
 
     ///broadcast the value
@@ -146,10 +155,10 @@ public:
      *
      * @note the co_await always throws exception await_canceled_exception.
      */
-    prepared_coro alert(std::atomic<bool> &alert_flag) {
+    prepared_coro alert(alert_flag_type &alert_flag) {
         prepared_coro out;
         lock_guard _(_mx);
-        alert_flag.store(true, std::memory_order_relaxed);
+        alert_flag.set();
         auto iter = std::find_if(_results.begin(), _results.end(), [&](const awaiting_info &x){
             return x.i == &alert_flag;
         });
@@ -165,9 +174,13 @@ public:
 
     }
 
+    bool empty() const {
+        lock_guard _(_mx);
+        return _results.empty();
+    }
 
 protected:
-    Lock _mx;
+    mutable Lock _mx;
     std::vector<awaiting_info> _results;
     std::vector<prepared_coro> _ready_to_run;
 
