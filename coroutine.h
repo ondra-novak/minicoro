@@ -563,6 +563,41 @@ public:
         }
     };
 
+    ///virtual interface to execute callback for resolution
+    class ICallback {
+    public:
+        virtual ~ICallback() = default;
+        ///start resolution, call the callback
+        virtual prepared_coro call(result) = 0;
+        ///move support
+        virtual void move_to(void *address) = 0;
+    };
+
+
+    ///object which implements lambda callback
+    /** This symbol is public to allow calculation of the size in bytes of this object */
+    template<std::invocable<result> Fn>
+    class CallbackImpl: public ICallback {
+    public:
+        CallbackImpl(Fn &&fn):_fn(std::forward<Fn>(fn)) {}
+        virtual prepared_coro call(result r) {
+            if constexpr(std::convertible_to<std::invoke_result_t<Fn, result>, prepared_coro>) {
+                return prepared_coro(_fn(std::move(r)));
+            } else {
+                _fn(std::move(r));
+                return {};
+            }
+        }
+        virtual void move_to(void *address) {
+            new(address) CallbackImpl(std::move(_fn));
+        }
+
+
+    protected:
+        Fn _fn;
+    };
+
+
     ///construct with no value
     awaitable(std::nullptr_t) {};
     ///destructor
@@ -952,38 +987,6 @@ protected:
         callback_ptr
     };
 
-    ///virtual interface to execute callback for resolution
-    class ICallback {
-    public:
-        virtual ~ICallback() = default;
-        ///start resolution, call the callback
-        virtual prepared_coro call(result) = 0;
-        ///move support
-        virtual void move_to(void *address) = 0;
-    };
-
-
-
-    template<std::invocable<result> Fn>
-    class CallbackImpl: public ICallback {
-    public:
-        CallbackImpl(Fn &&fn):_fn(std::forward<Fn>(fn)) {}
-        virtual prepared_coro call(result r) {
-            if constexpr(std::convertible_to<std::invoke_result_t<Fn, result>, prepared_coro>) {
-                return prepared_coro(_fn(std::move(r)));
-            } else {
-                _fn(std::move(r));
-                return {};
-            }
-        }
-        virtual void move_to(void *address) {
-            new(address) CallbackImpl(std::move(_fn));
-        }
-
-
-    protected:
-        Fn _fn;
-    };
 
     static constexpr auto callback_max_size = std::max(sizeof(void *) * 4, sizeof(store_type));
 
@@ -1108,6 +1111,7 @@ protected:
 
     friend class awaitable_result<T>;
     friend class _details::promise_type_base<T>;
+
 };
 
 
@@ -1908,25 +1912,25 @@ protected:
 
 };
 
-    
+
 ///a emulation of coroutine which sets atomic flag when it is resumed
 class sync_frame : public coro_frame<sync_frame> {
     public:
-    
+
         sync_frame() = default;
         sync_frame (const sync_frame  &) = delete;
         sync_frame &operator = (const sync_frame  &) = delete;
-    
+
         ///wait for synchronization
         void wait() {
             _signal.wait(false);
         }
-    
+
         ///reset synchronization
         void reset() {
             _signal = false;
         }
-    
+
     protected:
         friend class coro_frame<sync_frame>;
         std::atomic<bool> _signal = {};
@@ -1934,9 +1938,9 @@ class sync_frame : public coro_frame<sync_frame> {
             _signal = true;
             _signal.notify_all();
         }
-    
+
     };
-    
+
     template<typename T>
     inline void awaitable<T>::wait() {
         if (!await_ready()) {
@@ -1944,5 +1948,5 @@ class sync_frame : public coro_frame<sync_frame> {
             await_suspend(sync.get_handle()).resume();
             sync.wait();
         }
-    }  
+    }
 }
