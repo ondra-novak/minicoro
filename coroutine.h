@@ -266,24 +266,6 @@ public:
 
 };
 
-template<int n>
-class alloc_in_buffer {
-public:
-    alloc_in_buffer(char *buff):_buff(buff) {}
-    struct overrides {
-        template<typename ... Args>
-        void *operator new(std::size_t sz, alloc_in_buffer &inst, Args && ... ) {
-            if (sz > n) throw std::bad_alloc();
-            return inst._buff;
-        }
-        template<typename ... Args>
-        void operator delete(void *, alloc_in_buffer &, Args && ... ) {
-        }
-        void operator delete(void *, std::size_t) {}
-    };
-protected:
-    char *_buff;
-};
 }
 
 ///construct coroutine
@@ -794,7 +776,8 @@ public:
      */
     template<std::invocable<awaitable &> _Callback>
     prepared_coro set_callback (_Callback &&cb) {
-        return set_callback_internal(std::forward<_Callback>(cb));
+        objstdalloc alloc;
+        return set_callback_internal(std::forward<_Callback>(cb), alloc);
     }
 
     ///set callback, which is called once the awaitable is resolved
@@ -814,28 +797,6 @@ public:
         return set_callback_internal(std::forward<_Callback>(cb), a);
     }
 
-    ///set callback, which is called once the awaitable is resolved
-    /**
-     * @param cb callback function. The function receives reference
-     * to awaitable in resolved state
-     * @param buffer reference to a buffer space where callback will be
-     * allocated. The buffer must be large enough to fit the callback.
-     * You can use template awaiting_callback_size to calculate minimum
-     * space required for the callback. This number is available during
-     * compile time
-     *
-     * @return prepared coroutine (if there is an involved one), you
-     * can postpone its resumption by storing result and release it
-     * later
-     *
-     * @note you can set only one callback or coroutine
-     */
-    template<std::invocable<awaitable &> _Callback, int n>
-    prepared_coro set_callback (_Callback &&cb, char (&buffer)[n]) {
-            static_assert(awaiting_callback_size<T, _Callback> <= n, "Callback doesn't fit to buffer");
-            _details::alloc_in_buffer<n> a(buffer);
-            return set_callback_internal(std::forward<_Callback>(cb), a);
-    }
 
     ///synchronous await
     decltype(auto) await() {
@@ -902,6 +863,7 @@ public:
     void cancel() {
         if (_owner) throw invalid_state();
         destroy_state();
+        _state = no_value;
     }
 
     ///determines whether coroutine is running in detached mode
@@ -1328,81 +1290,109 @@ public:
     }
 };
 
-
-///Contains function which can be called through awaitable<T>::result object
+///a class that mimics coroutine allowing to callback a member function with arguments
 /**
- * The function works as a coroutine associated with existing awaitable, but
- * the awaitable instance is not visible for the user. You can only
- * call this function through the result object
+ * @tparam T type of result the callback accepts
+ * @tparam Instance pointer class (raw pointer, or shared or unique ptr), to an instance
+ * @tparam member_fn pointer to member function to call. The member function must have
+ * the first argument awaitable<T> & (reference) and other arguments mus be references
+ * to Args...
+ * @tparam Args list of optional args passed to the function when callback is called.
  *
  *
- * @tparam T type of return value (can be void)
- * @tparam _CB callback function. It must accept reference to internal awaitable
- * object, where it can retrieve value
- * @tparam _Allocator can specify allocator used to allocate the function (similar to coroutine)
- *
- * @note main benefit of this class is that you can calculate size of the occupied
- * memory during compile time. This is not possible for standard coroutines. Knowing
- * the occupied size allows to reserve buffers for its allocation.
+ * @code
+ *  //function
+ * void Foo::on_complete(awaitable<int> &awt, int &bar, bool &baz);
+ *  //declaration of instance
+ * await_member_callback<int, Foo *, &Foo::on_complete, int, bool> _callback_instance;
+ *  //usage
+ *  awaitable<int> awt = do_async();
+ *  _callback_instance.await(awt, this, 42,false);
+ * @endcode
  *
  */
-template<typename T, std::invocable<awaitable<T> &> _CB, coro_allocator _Allocator >
-class awaiting_callback : public coro_frame<awaiting_callback<T, _CB, _Allocator> >
-                        , public _Allocator::overrides
-{
+template<typename T, typename Instance, auto member_fn, typename ... Args>
+requires(requires(awaitable<T> &awt, Instance instance, Args &... args){
+    {((*instance).*member_fn)(awt, args...)};
+})
+class await_member_callback :
+        public coro_frame<await_member_callback<T, Instance, member_fn, Args...> >{
 public:
-    ///Create result object to call specified callback function
+    await_member_callback() {}
+
+    ///Register this instance to await on a an awaitable
     /**
-     * @param cb callback function
-     * @return result object
+     * @param awt awaitable object
+     * @param instance a pointer which points to an instance of the callback object
+     * @param args arguments
      */
-    static typename awaitable<T>::result create(_CB &&cb) {
-        awaiting_callback *n = new awaiting_callback(std::forward<_CB>(cb));
-        return n->_awt.create_result(n->get_handle());
+    void await(awaitable<T> &&awt, Instance instance, Args ... args) {
+        return await(awt,instance, std::forward<Args>(args)...);
+    }
+    ///Register this instance to await on a an awaitable
+    /**
+     * @param awt awaitable object
+     * @param instance a pointer which points to an instance of the callback object
+     * @param args arguments
+     */
+    void await(awaitable<T> &awt, Instance instance, Args ... args) {
+        _instance = std::move(instance);
+        _args.emplace(std::move(args)...);
+        await_cont(awt);
     }
 
-    ///Create result object to call specified callback function
-    /**
-     * @param cb callback function
-     * @param alloc reference allocator instance which is used to allocate this object
-     * @return result object
+    ///Continue in await operation
+    /** When asynchronous operation must be processed per-partes, this allows
+     * to await on asynchronous operation while keeping initial setup unchanged.
+     * This function is intended to be used inside of the callback function to
+     * continue awaiting
+     *
+     * @param awt awaiter
      */
-    static typename awaitable<T>::result create(_CB &&cb, _Allocator &alloc) {
-        awaiting_callback *n = new(alloc) awaiting_callback(std::forward<_CB>(cb));
-        return n->_awt.create_result(n->get_handle());
+    void await_cont(awaitable<T> &&awt) {
+        await_cont(awt);
     }
-protected:
-    ///constructor is not visible on the API
-    awaiting_callback(_CB &&cb):_cb(std::forward<_CB>(cb)) {}
-
-    ///callback function itself
-    _CB _cb;
-    ///awaitable object associated with the function
-    awaitable<T> _awt = {nullptr};
-
-    ///called when resume is triggered
-    void do_resume() {
-        try {
-            _cb(_awt);
-            do_destroy();
-        } catch (...) {
-            async_unhandled_exception();
-            do_destroy();
+    ///Continue in await operation
+    /** When asynchronous operation must be processed per-partes, this allows
+     * to await on asynchronous operation while keeping initial setup unchanged.
+     * This function is intended to be used inside of the callback function to
+     * continue awaiting
+     *
+     * @param awt awaiter
+     */
+    void await_cont(awaitable<T> &awt) {
+        if (awt.await_ready()) {
+            std::apply([&](auto & ... args){
+                ((*_instance).*member_fn)(_awt, args...);
+            }, *_args);
+        } else {
+            _awt = std::move(awt);
+            _awt.await_suspend(this->get_handle());
         }
     }
-    void do_destroy() {
-        delete this;
-    }
 
-    friend class coro_frame<awaiting_callback<T, _CB, _Allocator> >;
+protected:
+    Instance _instance = {};
+    std::optional<std::tuple<Args...> >_args;
+    awaitable<T> _awt;
+
+    friend class coro_frame<await_member_callback<T, Instance, member_fn, Args...> >;
+    void do_resume() {
+        std::apply([&](auto & ... args){
+            ((*_instance).*member_fn)(_awt, args...);
+        }, *_args);
+    }
+    void do_destroy() {
+        //empty
+    }
 };
+
 
 
 template <typename T>
 template <typename _Callback, typename _Allocator>
 inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Allocator &a)
 {
-
     prepared_coro out = {};
 
     if (await_ready()) {
@@ -1417,12 +1407,10 @@ inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Alloca
         } else if (_state == coro) {
             out = _coro.start(std::move(res));
         }
+        cancel();
     }
     return out;
 }
-
-
-
 
 template<typename T>
 inline T coroutine<T>::await() {
