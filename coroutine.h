@@ -1106,14 +1106,26 @@ public:
      */
 
     template<typename _Val>
-    requires(std::is_convertible_v<_Val, T> && !std::is_same_v<std::decay_t<_Val>, awaitable_result>)
     prepared_coro operator=(_Val && val) {
-        auto p = _ptr.release();
-        if (p) {
-            p->set_value(std::forward<_Val>(val));
-            return p->wakeup();
+        static_assert(std::is_convertible_v<_Val, T> || std::is_same_v<_Val, awaitable_result> || std::is_convertible_v<_Val, std::exception_ptr>);
+        if constexpr(std::is_same_v<_Val, awaitable_result>) {
+            auto p = _ptr.release();
+            if (p) {
+                p->drop();
+                return p->wakeup();
+            } else {
+                return {};
+            }
+        } else if constexpr(std::is_convertible_v<_Val, std::exception_ptr>) {
+            return this->set_exception(std::forward<_Val>(val));
         } else {
-            return {};
+            auto p = _ptr.release();
+            if (p) {
+                p->set_value(std::forward<_Val>(val));
+                return p->wakeup();
+            } else {
+                return {};
+            }
         }
     }
 
