@@ -1337,8 +1337,10 @@ public:
      * @param awt awaitable object
      * @param instance a pointer which points to an instance of the callback object
      * @param args arguments
+     * @return prepared_coro of asynchronous operation. If operation is already
+     * done, returns prepared_coro of this callback
      */
-    void await(awaitable<T> &&awt, Instance instance, Args ... args) {
+    prepared_coro await(awaitable<T> &&awt, Instance instance, Args ... args) {
         return await(awt,instance, std::forward<Args>(args)...);
     }
     ///Register this instance to await on a an awaitable
@@ -1346,11 +1348,13 @@ public:
      * @param awt awaitable object
      * @param instance a pointer which points to an instance of the callback object
      * @param args arguments
+     * @return prepared_coro of asynchronous operation. If operation is already
+     * done, returns prepared_coro of this callback
      */
-    void await(awaitable<T> &awt, Instance instance, Args ... args) {
+    prepared_coro await(awaitable<T> &awt, Instance instance, Args ... args) {
         _instance = std::move(instance);
         _args.emplace(std::move(args)...);
-        await_cont(awt);
+        return await_cont(awt);
     }
 
     ///Continue in await operation
@@ -1360,9 +1364,13 @@ public:
      * continue awaiting
      *
      * @param awt awaiter
+     *
+     * @return prepared_coro of asynchronous operation. If operation is already
+     * done, returns prepared_coro of this callback
+     *
      */
-    void await_cont(awaitable<T> &&awt) {
-        await_cont(awt);
+    prepared_coro await_cont(awaitable<T> &&awt) {
+        return await_cont(awt);
     }
     ///Continue in await operation
     /** When asynchronous operation must be processed per-partes, this allows
@@ -1371,15 +1379,16 @@ public:
      * continue awaiting
      *
      * @param awt awaiter
+     *
+     * @return prepared_coro of asynchronous operation. If operation is already
+     * done, returns prepared_coro of this callback
      */
-    void await_cont(awaitable<T> &awt) {
+    prepared_coro await_cont(awaitable<T> &awt) {
+        _awt = std::move(awt);
         if (awt.await_ready()) {
-            std::apply([&](auto & ... args){
-                ((*_instance).*member_fn)(_awt, args...);
-            }, *_args);
+            return this->get_handle();
         } else {
-            _awt = std::move(awt);
-            _awt.await_suspend(this->get_handle());
+            return _awt.await_suspend(this->get_handle());
         }
     }
 
@@ -1389,9 +1398,9 @@ protected:
     awaitable<T> _awt;
 
     friend class coro_frame<await_member_callback<T, Instance, member_fn, Args...> >;
-    void do_resume() {
-        std::apply([&](auto & ... args){
-            ((*_instance).*member_fn)(_awt, args...);
+    auto do_resume() {
+        return std::apply([&](auto & ... args){
+            return ((*_instance).*member_fn)(_awt, args...);
         }, *_args);
     }
     void do_destroy() {
