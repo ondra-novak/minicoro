@@ -287,12 +287,10 @@ protected:
     }
 
 
-    ///a callback function intended to call this object if lock is complete
-    using resolve_cb = awaitable<coro_mutex::ownership>::member_callback<multi_lock, &multi_lock::lock_complete>;
 
     prepared_coro lock_first() {
         //initiate lock - call the callback when done - use cb_buffer to store callback's internals
-        return locking[first]->lock().set_callback(resolve_cb(this), cb_buffer);
+        return _cb_completion.await(locking[first]->lock(),this);
     }
 
     int lock_others() {
@@ -323,8 +321,8 @@ protected:
     coro_mutex::ownership owns[n] = {};
     //result
     awaitable<void>::result r = {};
-    //buffer to store callback's internals
-    char cb_buffer[awaiting_callback_size<coro_mutex::ownership, resolve_cb>];
+    ///callback internals
+    await_member_callback<coro_mutex::ownership, multi_lock *,  &multi_lock::lock_complete> _cb_completion;
     //first mutex to lock asynchronously
     int first = 0;
 };

@@ -23,7 +23,7 @@ awaitable<void> coro_test(distributor<int, empty_lockable> &dist, const void *id
     CHECK_EQUAL(i, 40);
 }
 
-awaitable<void> coro_alert_test(distributor<int, empty_lockable> &dist, std::atomic<bool> &b) {
+awaitable<void> coro_alert_test(distributor<int, empty_lockable> &dist, alert_flag_type &b) {
 
     int p = 10;
     while (true) {
@@ -39,8 +39,8 @@ int main() {
     bool ident_a;
     bool ident_b;
     bool ident_c;
-    std::atomic<bool> alt = {false};
-    std::atomic<bool> alt2 = {false};
+    alert_flag_type alt;
+    alert_flag_type alt2;
     distributor<int, empty_lockable> dist;
     awaitable<void> a = coro_test(dist, &ident_a);
     awaitable<void> b = coro_test(dist, &ident_b);
@@ -66,7 +66,7 @@ int main() {
     CHECK_EQUAL(n,1);
     dist.broadcast(30);
     dist.alert(alt);
-    CHECK_EQUAL(alt.load(), true);
+    CHECK_EQUAL(static_cast<bool>(alt), true);
     n = as.wait();
     CHECK_EQUAL(n,3);
     dist.broadcast(40);

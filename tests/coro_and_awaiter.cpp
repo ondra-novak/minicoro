@@ -44,12 +44,11 @@ void test1(std::ostream &out) {
     auto cb = [&](awaitable<int> &result) {
         out << result.await_resume() << '/';
     };
-    char buffer[awaiting_callback_size<int, decltype(cb)>];
 
 
     test_void(out);
     auto r = test1_call();
-    r.set_callback(std::move(cb), buffer);
+    r.set_callback(std::move(cb));
     prom=42;
 
     callback_by_member bar;

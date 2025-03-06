@@ -3,6 +3,7 @@
 #include "coroutine.h"
 #include <vector>
 #include <algorithm>
+#include "alert_flag.h"
 
 namespace MINICORO_NAMESPACE {
 
@@ -51,7 +52,7 @@ public:
         _results.push_back({std::move(r), id});
 
     }
-    void add_listener(alert_flag_type a, result_object r) {
+    void add_listener(alert_flag_type &a, result_object r) {
         lock_guard _(_mx);
         if (a) return;
         _results.push_back({std::move(r), &a});

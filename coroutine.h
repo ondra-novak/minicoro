@@ -108,6 +108,28 @@ OTHER DEALINGS IN THE SOFTWARE.
 
 namespace MINICORO_NAMESPACE {
 
+template<typename T>
+concept IsAwaitSuspendResult = std::is_void_v<T> || std::is_convertible_v<T, bool> || std::is_convertible_v<T, std::coroutine_handle<> >;
+
+template<typename T>
+concept is_awaiter = requires(T a, std::coroutine_handle<> h) {
+    {a.await_ready()} -> std::same_as<bool>;
+    {a.await_suspend(h)} -> IsAwaitSuspendResult;
+    {a.await_resume()};
+};
+
+template<typename T>
+concept has_co_await = requires(T a) {
+    { a.operator co_await() } -> is_awaiter;
+};
+
+template<typename T>
+concept has_global_co_await = requires(T a) {
+    { operator co_await(a) } -> is_awaiter;
+};
+
+template<typename T>
+concept is_awaitabe = is_awaiter<T> || has_global_co_await<T> || has_co_await<T>;
 
 ///definition of allocator interface
 template<typename T>
@@ -527,23 +549,6 @@ public:
     using result = awaitable_result<T>;
     ///allows to use awaitable to write coroutines
     using promise_type = coroutine<T>::promise_type;
-
-    ///helper template to construct member function callback (with this as closure)
-    /**
-     * @tparam _Class name of class of this
-     * @tparam member pointer to member function to call
-     *
-     * main benefit is you can calculate size of the class in compile time
-     */
-    template<typename _CLass, prepared_coro (_CLass::*member)(awaitable &)>
-    class member_callback {
-        _CLass *_ptr;
-    public:
-        member_callback(_CLass *me):_ptr(me){}
-        prepared_coro operator()(awaitable &x)  const {
-            return (_ptr->*member)(x);
-        }
-    };
 
     ///virtual interface to execute callback for resolution
     class ICallback {
@@ -1409,12 +1414,79 @@ protected:
 };
 
 
+///Contains function which can be called through awaitable<T>::result object
+/**
+ * The function works as a coroutine associated with existing awaitable, but
+ * the awaitable instance is not visible for the user. You can only
+ * call this function through the result object
+ *
+ *
+ * @tparam T type of return value (can be void)
+ * @tparam _CB callback function. It must accept reference to internal awaitable
+ * object, where it can retrieve value
+ * @tparam _Allocator can specify allocator used to allocate the function (similar to coroutine)
+ *
+ * @note main benefit of this class is that you can calculate size of the occupied
+ * memory during compile time. This is not possible for standard coroutines. Knowing
+ * the occupied size allows to reserve buffers for its allocation.
+ *
+ */
+template<typename T, std::invocable<awaitable<T> &> _CB, coro_allocator _Allocator >
+class awaiting_callback : public coro_frame<awaiting_callback<T, _CB, _Allocator> >
+                        , public _Allocator::overrides
+{
+public:
+    ///Create result object to call specified callback function
+    /**
+     * @param cb callback function
+     * @return result object
+     */
+    static typename awaitable<T>::result create(_CB &&cb) {
+        awaiting_callback *n = new awaiting_callback(std::forward<_CB>(cb));
+        return n->_awt.create_result(n->get_handle());
+    }
+
+    ///Create result object to call specified callback function
+    /**
+     * @param cb callback function
+     * @param alloc reference allocator instance which is used to allocate this object
+     * @return result object
+     */
+    static typename awaitable<T>::result create(_CB &&cb, _Allocator &alloc) {
+        awaiting_callback *n = new(alloc) awaiting_callback(std::forward<_CB>(cb));
+        return n->_awt.create_result(n->get_handle());
+    }
+protected:
+    ///constructor is not visible on the API
+    awaiting_callback(_CB &&cb):_cb(std::forward<_CB>(cb)) {}
+
+    ///callback function itself
+    _CB _cb;
+    ///awaitable object associated with the function
+    awaitable<T> _awt = {nullptr};
+
+    ///called when resume is triggered
+    void do_resume() {
+        try {
+            _cb(_awt);
+        } catch (...) {
+            async_unhandled_exception();
+        }
+        do_destroy();
+    }
+    void do_destroy() {
+        delete this;
+    }
+
+    friend class coro_frame<awaiting_callback<T, _CB, _Allocator> >;
+};
 
 template <typename T>
 template <typename _Callback, typename _Allocator>
 inline prepared_coro awaitable<T>::set_callback_internal(_Callback &&cb, _Allocator &a)
 {
     prepared_coro out = {};
+
 
     if (await_ready()) {
         cb(*this);
@@ -1607,6 +1679,18 @@ protected:
     counter _cnt;
 
 };
+
+///Declare concurrent section - section where multiple coroutines can run concurrently
+/**
+ * @code
+ * concurrent_section cs(awt1,awt2,awt3,awt4,...)
+ * //any other code
+ * co_await cs;
+ * @endcode
+ * 
+ * 
+ */
+using concurrent_section = allof_set;
 
 ///Helps to select first evaluated of set of awaitable objects
 class anyof_set {
