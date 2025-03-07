@@ -1390,7 +1390,7 @@ public:
      */
     prepared_coro await_cont(awaitable<T> &awt) {
         _awt = std::move(awt);
-        if (awt.await_ready()) {
+        if (_awt.await_ready()) {
             return this->get_handle();
         } else {
             return _awt.await_suspend(this->get_handle());
