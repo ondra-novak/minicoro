@@ -283,10 +283,10 @@ using generator = async_generator<T, Param, Alloc>;
 
 template<typename T, typename Param, typename Allocator>
 async_generator<T, Param, Allocator> generator_agregator(Allocator &, std::vector<generator<T, Param> > g) {
-
+/*
     std::vector<awaitable<T> > awts;
     for (auto &x: g) awts.emplace(x.start());
-    anyof_set s;
+    when_each_dynamic s;
     unsigned int cnt = 0;
     for (auto &x: awts) s.add(x, cnt++);
     while (cnt) {
@@ -306,6 +306,7 @@ async_generator<T, Param, Allocator> generator_agregator(Allocator &, std::vecto
         }
         --cnt;
     }
+    */
 }
 
 

@@ -23,8 +23,7 @@ awaitable<int> main_coro(scheduler &sch, std::chrono::milliseconds ms) {
     alert_flag_type flag;
 
     awaitable<int> c = cycle_coro(sch, flag);
-    anyof_set s;
-    s.add(c, 0);
+    when_all s(c);
     co_await sch.sleep_for(ms);
     sch.alert(flag);
     co_await s;

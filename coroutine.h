@@ -1672,16 +1672,20 @@ public:
     prepared_coro add(X &awt) {
         if (!awt.await_ready()) {
             _cnt.count.fetch_add(1, std::memory_order_relaxed);
-            auto r = awt.await_suspend(_cnt.get_handle());
-            if constexpr (std::is_void_v<decltype(r)>) {
-                return {};
-            } else if constexpr(std::is_convertible_v<decltype(r), bool>) {
-                if (!r) {
-                    _cnt.count.fetch_sub(1, std::memory_order_relaxed);
-                }
+
+            if constexpr (std::is_void_v<decltype(awt.await_suspend(_cnt.get_handle()))>) {
+                awt.await_suspend(_cnt.get_handle());
                 return {};
             } else {
-                return r;
+                auto r = awt.await_suspend(_cnt.get_handle());
+                if constexpr(std::is_convertible_v<decltype(r), bool>) {
+                    if (!r) {
+                        _cnt.count.fetch_sub(1, std::memory_order_relaxed);
+                    }
+                    return {};
+                } else {
+                    return r;
+                }
             }
         }
         return {};
@@ -1744,188 +1748,239 @@ protected:
 
 };
 
-
-///Helps to select first evaluated of set of awaitable objects
-class anyof_set {
+///Wait and iterate over completed results
+/**
+ * @tparam count count of awaited objects, This value is often deduced
+ */
+template<unsigned int count>
+class when_each {
 public:
 
-    ///construct empty set
-    anyof_set() = default;
-    ///cannot be copied
-    anyof_set(const anyof_set &) = delete;
-    ///cannot be copied
-    anyof_set &operator=(const anyof_set &) = delete;
-
-
-    ///add awaitable to the set assign an unique uid
+    ///constructs from an array of awaitable objects
     /**
-     * @param awt awaitable object ready to be awaited
-     * @param uid associated unique id, this id is returned from co_await
-     * @return by adding awaitable causes that asynchronous operation is started
-     * at background. If it is started as coroutine, this function returns its
-     * prepared handle. You can schedule its resumption. The return
-     * value can be ignored
+     * @param awts array of awaitable object
      *
-     * It is possible to add new items between awaiting
+     * @note when constructor finishes, the awaitable objects are
+     * evaluated and eventually await_suspend is called if the
+     * awaitable is not ready yet. This can cause that
+     * evaluation can run on background (in different thread)
      */
-    template<typename X>
-    prepared_coro add(awaitable<X> &awt, unsigned int uid) {
-        slot *sel = _first_free.load();
-        if (sel) {
-            while (!_first_free.compare_exchange_weak(sel, sel->_next));
-            sel->reset(uid);
-        } else {
-            _sls.emplace_back(this, uid);
-            sel = &_sls.back();
-        }
-        if (awt.await_ready()) {
-            sel->do_resume();
-            return {};
-        } else {
-            return awt.await_suspend(sel->get_handle());
+    template<is_awaiter Awt>
+    when_each(Awt (&awts)[count]):_cnt(count){
+        for (std::size_t i = 0; i < count; ++i) {
+            add(awts[i], i);
         }
     }
-
-    ///start awaiting on the set
+    ///constructs from multiple arguments
     /**
-     * @return unique identifier of first evaluated awaitable from the set.
-     * The object is also removed from the set, so next call
-     * returns next evaluated awaitable
+     * @param awts list of awaitable/awaiters, each can be different type
+     *
+     * @note when constructor finishes, the awaitable objects are
+     * evaluated and eventually await_suspend is called if the
+     * awaitable is not ready yet. This can cause that
+     * evaluation can run on background (in different thread)
      */
-    awaitable<unsigned int> operator co_await() {
-        return check();
+    template<is_awaiter ... Awts>
+    requires(sizeof...(Awts) <= count)
+    when_each(Awts &... awts):_cnt(sizeof...(Awts)) {
+        std::size_t idx = 0;
+        (add(awts, idx++),...);
     }
 
-    ///start awaiting on the set
+    ///construct from the list
+    /** This constructor cannot use deduction guide. You need to
+     * specify count above expected size of the list. The actual
+     * list can be smaller, but not larger than count
+     * @param list object which is iteratable by ranged-for
+     */
+    template<range_for_iterable X>
+    when_each(X &list) {
+        std::size_t idx = 0;
+        for (auto &x: list) {
+            add(x, idx++);
+            if (idx == count) break;
+        }
+        _cnt = idx;
+    }
+
+    ///cannot copy
+    when_each(const when_each &) = delete;
+    ///cannot copy
+    when_each &operator=(const when_each &) = delete;
+
+    ///destructor ensures that all awaitables are serialized (join)
+    /** @note destructor can't use co_await, it joins synchronously
+     */
+    ~when_each() {
+        while (_nx < _cnt) wait();
+    }
+
+
+    ///retrieve awaitable object for next complete awaitable
     /**
-     * @return unique identifier of first evaluated awaitable from the set.
-     * The object is also removed from the set, so next call
-     * returns next evaluated awaitable
+     * @return the awaitable object. The result itself is
+     * zero base index of awaitable which is ready for result
+     * retrieval.
+     *
+     * To retrieve result of the awaitable, you need just call
+     * await_resume() of complete awaitable (which index is returned
+     * by this function)
+     *
+     */
+    awaitable<unsigned int> get_awaitable() {
+        if (_nx == _cnt) return nullptr;
+        unsigned int v = _finished[_nx].load(std::memory_order_acquire);
+        if (v != 0) {
+            ++_nx;
+            return v - 2;
+        }
+        return [this](awaitable<unsigned int>::result r) {
+            _r = std::move(r);
+            std::size_t v = _finished[_nx].exchange(1, std::memory_order_acquire);
+            if (v != 0) {
+                ++_nx;
+                _r(v-2);
+            }
+        };
+    }
+
+    ///co_await to wait until next awaitable is complete
+    /**
+     * @return is co_awaited, it returns index of awaitable object
+     * which is complete. To retrieve result, you need to call
+     * await_resume of this awaitable
+     */
+    awaitable<unsigned int> operator co_await() {return get_awaitable();}
+
+    ///Wait synchronously
+    /**
+     Useful to wait in non-coroutine function
+     @return index of complete awaitable
      */
     unsigned int wait() {
-        return check().await();
+        return get_awaitable();
     }
+
+    ///determines, whether there are still pending awaitables
+    /**
+     * @retval true still pending
+     * @retval false no more pending, you can destroy this object
+     */
+    explicit operator bool() const{
+        return _nx < _cnt;
+    }
+
 
 
 protected:
 
-    ///slot ready to accept finished async operation
-    /** All slots can be ordered in linked list */
-    struct slot: coro_frame<slot> {
-        ///pointer to owner
-        anyof_set *owner = nullptr;
-        ///next in linked list
-        slot *_next = nullptr;
-        ///assigned uid
-        unsigned int _uid = 0;
 
-        ///construct
-        slot(anyof_set *owner, unsigned int uid):owner(owner),_uid(uid) {}
+    ///contains fake-coroutine which is called when real coroutine would be resumed
+    struct Slot: coro_frame<Slot> { // @suppress("Miss copy constructor or assignment operator")
+        when_each *_parent;
 
-        ///called when coroutine is resumed because operation is complete
         prepared_coro do_resume() {
-            //init next pointer
-            _next = nullptr;
-            //put self into _done_stack atomically
-            while (!owner->_done_stack.compare_exchange_weak(_next, this));
-            //try to acquire current awaitable pointer (and disable it for others)
-            auto w = owner->cur_awaiting.exchange(nullptr);
-            //if success
-            if (w) {
-                //this path is processed by only one thread
-                //pop first item from queue (don't need to be our item)
-                auto x = owner->pop_queue();
-                //send result
-                auto r = awaitable_result(w);
-                if (x) {
-                    return r(*x);
-                }
-
-            }
-            //this thread is finished
-            return {};
+            return _parent->resumed(this);
         }
-        void reset(unsigned int uid) {
-            this->_uid = uid;
-            this->_next = nullptr;
+        void do_destroy() {
+
         }
     };
-    std::atomic<awaitable<unsigned int> *> cur_awaiting = {};
-    std::deque<slot> _sls;
-    std::atomic<slot *> _done_stack = nullptr;
-    slot *_done_queue = nullptr;
-    std::atomic<slot *> _first_free = nullptr;
 
-    ///pop item from queue
+    ///list of prepared fake-coroutines to catch resume attempt
+    Slot _slots[count];
+    ///contains indexes of complete awaitables
     /**
-     * @return item in queue, or empty if queue is empty (atomically)
+     * The actual value is not index directly, value is increased by 2
+     * - value 0 - not complete yet
+     * - value 1 - not complete yet but awaitin
+     * - other - index of complete + 2
      */
-    std::optional<unsigned int> pop_queue() {
-        //test whether we have anything in queue
-        if (!_done_queue) {
-            //acquire stack
-            auto p = _done_stack.exchange(nullptr);
-            //reverse stack to queue
-            while (p) {
-                auto z = p;
-                z = z->_next;
-                p->_next = _done_queue;
-                _done_queue = p;
-                p = z;
+    std::atomic<unsigned int> _finished[count] ={};
+    ///contains index of free slot
+    std::atomic<unsigned int> _free_slot = {};
+    ///contains index of next tested slot
+    unsigned int _nx = 0;
+    ///contains count of slots
+    unsigned int _cnt = 0;
+    awaitable<unsigned int>::result  _r = {};
+
+    ///register to slot
+    /**
+     * @param awt awaitable
+     * @param idx index of slot
+     * @return prepared coroutine if resume happens
+     */
+    template<is_awaiter Awt>
+    prepared_coro add(Awt &awt, std::size_t idx) {
+
+        //activate slot
+        _slots[idx]._parent = this;
+        //test whether awaiter is ready
+        if (awt.await_ready()) {
+            //if ready, we already resumed
+            resumed(&_slots[idx]);
+            //nothing to resume
+            return {};
+        } else {
+            //if not - depend of type await_suspend
+            //void return
+            if constexpr (std::is_void_v<decltype(awt.await_suspend(_slots[idx].get_handle()))>) {
+                //suspend
+                awt.await_suspend(_slots[idx].get_handle());
+                //return nothing
+                return {};
+            } else {
+                //suspend and retrieve value
+                auto r = awt.await_suspend(_slots[idx].get_handle());
+                //if value is bool
+                if constexpr(std::is_convertible_v<decltype(r), bool>) {
+                    //if bool is false - suspension did not happened
+                    if (!r) {
+                        //mark resumed
+                        return resumed(&_slots[idx]);
+                    }
+                    //suspend ok
+                    return {};
+                } else {
+                    //if std::coroutine_handle is returned return it as prepared_coro
+                    return r;
+                }
             }
         }
-        //we have queue?
-        if (_done_queue) {
-            //pick it
-            auto r = _done_queue;
-            //remove from queue
-            _done_queue = r->_next;
-            //get uid
-            auto uid = r->_uid;
-            r->_next = nullptr;
-            //place slot to free list
-            while (!_first_free.compare_exchange_weak(r->_next, r));
-            //return uid
-            return uid;
+    }
+
+    ///called when slot is resumed
+    /**
+     * @param nd pointer to slot
+     * @return prepared coroutine if resumption happened
+     */
+    prepared_coro resumed(Slot *nd) {
+        //calculate index
+        unsigned int idx = nd - _slots;
+        //calculate value
+        unsigned int v = idx + 2;
+        //retrieve next result slot
+        unsigned int wridx = _free_slot.fetch_add(1, std::memory_order_relaxed);
+        //exchange value
+        unsigned int st = _finished[wridx].exchange(v, std::memory_order_release);
+        //if there is 1, somebody already awaiting
+        if (st == 1) {
+            //advance _nx (we can, nobody else will be there)
+            ++_nx;
+            //resume awaiting coroutine
+            return _r(idx);
         }
-        //return empty
+        //nothing to resume
         return {};
     }
-
-    ///check state, return awaitable
-    awaitable<unsigned int> check() {
-        //try to pop from queue
-        auto v = pop_queue();
-        //if success,  return it synchronously
-        if (v) {
-            return *v;
-        }
-        //nothing in queue, start async operation.
-        return [this](auto r) -> prepared_coro{
-            //atomically publish current awaitable object
-            cur_awaiting.exchange(r.release());
-            //test race condition (someone finished, before publishing awaitable)
-            auto st = _done_stack.load();
-            //we found race condition,
-            if (st) {
-                //try get awaitable back
-                auto w = cur_awaiting.exchange(nullptr);
-                //we successed, so there is no parallel operation yet
-                if (w) {
-                    awaitable_result<unsigned int> r2(w);
-                    //pop from queue
-                    auto sr = pop_queue();
-                    if (sr) {
-                        //extract result and set the awaiter
-                        return r2(*sr);
-                    }
-                }
-                //if awaitable has been picked, the issue will be solved in other thread
-            }
-            return {};
-        };
-    }
 };
+
+template<typename Awt, unsigned int N>
+when_each(Awt (&)[N]) -> when_each<N>;
+
+template<is_awaiter... Awts>
+when_each(Awts&...) -> when_each<sizeof...(Awts)>;
 
 ///this class makes that callback function is called during destruction
 /**

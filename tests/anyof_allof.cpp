@@ -32,11 +32,8 @@ awaitable<void> coro_test_master(std::ostream &out) {
             coro_test(225,6),
     };
 
-    anyof_set s;
-    unsigned int idx = 0;
-    for (auto &x: lst) s.add(x, idx++);
-    while(idx) {
-        --idx;
+    when_each s(lst);
+    while(s) {
         auto r = co_await s;
         out << lst[r].await_resume() << "|";
     }

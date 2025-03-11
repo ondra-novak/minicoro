@@ -36,9 +36,9 @@ awaitable<void> coro_alert_test(distributor<int, empty_lockable> &dist, alert_fl
 
 
 int main() {
-    bool ident_a;
-    bool ident_b;
-    bool ident_c;
+    bool ident_a = false;
+    bool ident_b = false;
+    bool ident_c = false;;
     alert_flag_type alt;
     alert_flag_type alt2;
     distributor<int, empty_lockable> dist;
@@ -47,12 +47,7 @@ int main() {
     awaitable<void> c = coro_test(dist, &ident_c);
     awaitable<void> d = coro_alert_test(dist, alt);
     awaitable<void> e = coro_alert_test(dist, alt2);
-    anyof_set as;
-    as.add(a, 0);
-    as.add(b, 1);
-    as.add(c, 2);
-    as.add(d, 3);
-    as.add(e, 4);
+    when_each as(a,b,c,d,e);
 
     std::vector<prepared_coro> buff;
     dist.broadcast(buff,10);
