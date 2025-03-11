@@ -118,6 +118,8 @@ void detached_test() {
     detach_test_coro(true);
 }
 
+
+
 int main() {
     std::ostringstream s;
     test1(s);

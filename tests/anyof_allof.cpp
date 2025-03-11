@@ -43,7 +43,7 @@ awaitable<void> coro_test_master(std::ostream &out) {
 }
 
 awaitable<void> coro_test_master_all_off() {
-    awaitable<unsigned int>lst[] = {
+    awaitable<unsigned int> lst[] = {
             coro_test(1000,1),
             coro_test(500,2),
             coro_test(1500,3),
@@ -52,9 +52,7 @@ awaitable<void> coro_test_master_all_off() {
             coro_test(225,6),
     };
 
-    allof_set s;
-    for (auto &x: lst) s.add(x);
-    co_await s;
+    co_await when_all(lst);
     unsigned int idx = 1;
     for (auto &x: lst) {
         if (x.await_resume() != idx) {

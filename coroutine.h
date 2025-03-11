@@ -131,6 +131,13 @@ concept has_global_co_await = requires(T a) {
 template<typename T>
 concept is_awaitabe = is_awaiter<T> || has_global_co_await<T> || has_co_await<T>;
 
+template<typename T>
+concept range_for_iterable = requires(T t) {
+    { std::begin(t) } -> std::input_or_output_iterator;
+    { std::end(t) } -> std::input_or_output_iterator;
+    requires std::sentinel_for<decltype(std::end(t)), decltype(std::begin(t))>;
+};
+
 ///definition of allocator interface
 template<typename T>
 concept coro_allocator = (requires(T &val, void *ptr, std::size_t sz, float b, char c) {
@@ -1579,45 +1586,80 @@ protected:
     std::size_t _buffer_size = 0;
 };
 
-///Helps to await multiple awaitable until all of them are evaluated
+
+
+///start and wait for one or multiple tasks
 /**
+ * This class can be used to wait for multiple awaitables
+ *
  * @code
- * auto awt1 = async_op_1(...); //initiate first operation
- * auto awt2 = async_op_2(...); //initiate second operation
- * auto awt3 = async_op_3(...); //initiate third operation
- * allof_set s; //initialize set
- * s.add(awt1);  //register first awaitable
- * s.add(awt2);  //register second awaitable
- * s.add(awt3);  //register third awaitable
- * co_await s;   //wait until all are evaluated
- * auto r1 = awt1.await_resume(); //retrieve value of first
- * auto r2 = awt2.await_resume(); //retrieve value of second
- * auto r3 = awt3.await_resume(); //retrieve value of third
+ * co_await when_all(awt1,awt2,awt3);
+ * @endcode
+ *
+ * Note that all arguments are passed as reference. The co_await doesn't
+ * return value, you need to extract results from
+ * each awaitable after wait is complete
+ *
+ * The class can be used to run concurrently with a background coroutine, and
+ * to join its awaitable at the end of the section.
+ *
+ * @code
+ * auto awt1 = coro1();
+ * when_all c(awt1); //coroutine is started here
+ *  //any code here
+ * co_await c; //join
+ * @endcode
+ *
  */
-class allof_set {
+class when_all {
 public:
 
-    allof_set() = default;
+    ///construct empty
+    when_all() = default;
 
-    allof_set(const allof_set &) = delete;
-    allof_set &operator=(const allof_set &) = delete;
+    ///no copy
+    when_all(const when_all &) = delete;
+    ///no copy
+    when_all &operator=(const when_all &) = delete;
 
-    template<typename X, typename ... Args>
-    allof_set(awaitable<X> &first, Args & ... other) {
-        add(first);
+    ///construc using multiple awaiters
+    /**
+     * @param other list of awaiters. This can be awaitable<> but it
+     * also supports any direct awaiters. If the awaiter needs co_await
+     * operator, you need to create instance of its result before it
+     * can be used here
+     *
+     * @code
+     * auto need_op1 = async_op1();
+     * auto need_op2 = async_op2();
+     * auto awt1 = operator co_await(need_op1);
+     * auto awt2 = operator co_await(need_op2);
+     * co_await when_all(awt1,awt2);
+     * @endcode
+     */
+    template<is_awaiter... Awts>
+    when_all(Awts & ... other) {
         (add(other),...);
     }
 
-    template<typename X>
-    allof_set(std::span<awaitable<X> > list) {
+    ///construct from iteratable container
+    template<range_for_iterable X>
+    when_all(X &list) {
         for (auto &x: list) add(x);
     }
+
+    ///construct from array
+    template<is_awaiter Awt, int n>
+    when_all(Awt (&list)[n]) {
+        for (auto &x: list) add(x);
+    }
+
 
     ///add an awaitable object to set
     /** Intended way is to add multiple awaitables to the set
      * before you start to awaiting
      *
-     * @param awt awaitable object
+     * @param awt awaitable object or direct awaiter
      * @return because result of operation can be resumption of an
      * coroutine, its prepared handle is returned now. You can ignore
      * return value in most of cases
@@ -1626,17 +1668,32 @@ public:
      * in in pending state and you need to keep it until it is evaluated
      *
      */
-    template<typename X>
-    prepared_coro add(awaitable<X> &awt) {
+    template<is_awaiter X>
+    prepared_coro add(X &awt) {
         if (!awt.await_ready()) {
-            ++_cnt.count;
-            return awt.await_suspend(_cnt.get_handle());
+            _cnt.count.fetch_add(1, std::memory_order_relaxed);
+            auto r = awt.await_suspend(_cnt.get_handle());
+            if constexpr (std::is_void_v<decltype(r)>) {
+                return {};
+            } else if constexpr(std::is_convertible_v<decltype(r), bool>) {
+                if (!r) {
+                    _cnt.count.fetch_sub(1, std::memory_order_relaxed);
+                }
+                return {};
+            } else {
+                return r;
+            }
         }
         return {};
     }
 
     ///start awaiting operation
     awaitable<void> operator co_await() {
+        return start();
+    }
+
+    ///retrieve awaitable for this object
+    awaitable<void> get_awaitable() {
         return start();
     }
 
@@ -1655,6 +1712,9 @@ protected:
 
     //start co_await operation
     awaitable<void> start() {
+        if (_cnt.count.load(std::memory_order_acquire) == 1) {
+            return {};
+        }
         //this is asynchronous operation
         return [this](awaitable_result<void> r) {
             //publish result object
@@ -1664,15 +1724,19 @@ protected:
         };
     }
 
-    //mimics coroutine object is resumed for every complete result
-    //we just count down all attempts until it is reached zero
-    //then awaiting coroutine is resumed
     struct counter: coro_frame<counter> {
         std::atomic<unsigned int> count = {1};
         awaitable_result<void> r = {};
-        void do_resume() {
-            if (--count == 0) //if reached zero
-                r();            //resume awaiting
+        prepared_coro do_resume() {
+            //test whether we reached zero
+            if (count.fetch_sub(1, std::memory_order_relaxed)  == 1) {
+                //ensure that all results are visible
+                count.load(std::memory_order_acquire);
+                //resume awaiting coroutine
+                return r();
+            }
+            //still pending
+            return {};
         }
 
     };
@@ -1680,17 +1744,6 @@ protected:
 
 };
 
-///Declare concurrent section - section where multiple coroutines can run concurrently
-/**
- * @code
- * concurrent_section cs(awt1,awt2,awt3,awt4,...)
- * //any other code
- * co_await cs;
- * @endcode
- * 
- * 
- */
-using concurrent_section = allof_set;
 
 ///Helps to select first evaluated of set of awaitable objects
 class anyof_set {
@@ -2007,39 +2060,40 @@ protected:
 
 
 ///a emulation of coroutine which sets atomic flag when it is resumed
-class sync_frame : public coro_frame<sync_frame> {
-    public:
+class sync_frame: public coro_frame<sync_frame> {
+public:
 
-        sync_frame() = default;
-        sync_frame (const sync_frame  &) = delete;
-        sync_frame &operator = (const sync_frame  &) = delete;
+    sync_frame() = default;
+    sync_frame(const sync_frame&) = delete;
+    sync_frame& operator =(const sync_frame&) = delete;
 
-        ///wait for synchronization
-        void wait() {
-            _signal.wait(false);
-        }
-
-        ///reset synchronization
-        void reset() {
-            _signal = false;
-        }
-
-    protected:
-        friend class coro_frame<sync_frame>;
-        std::atomic<bool> _signal = {};
-        void do_resume() {
-            _signal = true;
-            _signal.notify_all();
-        }
-
-    };
-
-    template<typename T>
-    inline void awaitable<T>::wait() {
-        if (!await_ready()) {
-            sync_frame sync;
-            await_suspend(sync.get_handle()).resume();
-            sync.wait();
-        }
+    ///wait for synchronization
+    void wait() {
+        _signal.wait(false);
     }
+
+    ///reset synchronization
+    void reset() {
+        _signal = false;
+    }
+
+protected:
+    friend class coro_frame<sync_frame> ;
+    std::atomic<bool> _signal = { };
+    void do_resume() {
+        _signal = true;
+        _signal.notify_all();
+    }
+
+};
+
+template<typename T>
+inline void awaitable<T>::wait() {
+    if (!await_ready()) {
+        sync_frame sync;
+        await_suspend(sync.get_handle()).resume();
+        sync.wait();
+    }
+}
+
 }
