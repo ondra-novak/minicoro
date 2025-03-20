@@ -148,6 +148,25 @@ concept coro_allocator = (requires(T &val, void *ptr, std::size_t sz, float b, c
     {T::overrides::operator delete(ptr, sz)};
 });  //void can be specified in meaning of default allocator
 
+template<typename T>
+struct awaiter_result_def;
+template<is_awaiter T>
+struct awaiter_result_def<T> {
+    using type = decltype(std::declval<T>().await_resume());
+};
+template<has_co_await T>
+struct awaiter_result_def<T> {
+    using type = decltype(std::declval<T>().operator co_await().await_resume());
+};
+template<has_global_co_await T>
+struct awaiter_result_def<T> {
+    using type = decltype(operator co_await(std::declval<T>()).await_resume());
+};
+
+///Determines type returned by the awaiter
+template<is_awaitabe T>
+using awaiter_result = typename awaiter_result_def<T>::type;
+
 ///represents standard allocator
 /**
  * Some templates uses this class as placeholder for standard allocation, however it can be used
@@ -170,6 +189,18 @@ public:
     };
 };
 
+/// perform synchronous await (for non-coroutines)
+/** 
+ * @param awt awaiter
+ * @return return value of the awaiter
+ * @exception any can rethrow any exception from the awaiter
+ * 
+ * @note Do not use sync_await for awaiters expecting some action in context of resume,
+ * because the awaiter's result is accessed from a different thread. 
+ */ 
+template<is_awaitabe T>
+inline awaiter_result<T> sync_await(T &&awt);
+
 ///replaces simple void everywhere valid type is required
 struct void_type {};
 
@@ -185,7 +216,7 @@ concept is_member_fn_call_for_result = requires(T val, Obj obj, Fn fn) {
 template<typename T> class awaitable;
 template<typename T, std::invocable<awaitable<T> &> _CB, coro_allocator _Allocator = objstdalloc> class awaiting_callback;
 template<typename T, coro_allocator _Allocator = objstdalloc> class coroutine;
-template<typename T> class coro_frame;
+template<typename T, bool d = true> class coro_frame;
 template<typename T> class awaitable_result;
 
 
@@ -250,6 +281,35 @@ protected:
     std::unique_ptr<void,deleter> _coro;
 };
 
+
+/// perform call await_suspend and switch to different coroutine manually
+/** 
+ * @param awt awaiter, must be direct awaiter (operator co_await is not supported)
+ * @param h coroutine handle, which is suspended on the awaiter. The coroutine must be already
+ * in suspended state. The function can't suspend coroutine (this can handle only co_await), but
+ * it can associate the coroutine with the awaiter
+ * @return prepared_coro which should be resumed by caller or anytime later. It can
+ * also contain argument h, if the suspend has been rejected and the coroutine
+ * must be resumed immediately
+ */
+
+ template<is_awaiter _Awt>
+ prepared_coro call_await_suspend(_Awt &awt, std::coroutine_handle<> handle) {
+     using Ret = decltype(awt.await_suspend(handle));
+     static_assert(std::is_void_v<Ret>
+                 || std::is_convertible_v<Ret, std::coroutine_handle<> >
+                 || std::is_convertible_v<Ret, bool>);
+ 
+     if constexpr(std::is_convertible_v<Ret, std::coroutine_handle<> >) {
+         return prepared_coro(awt.await_suspend(handle));
+     } else if constexpr(std::is_convertible_v<Ret, bool>) {
+         bool b = awt.await_suspend(handle);
+         return b?prepared_coro():prepared_coro(handle);
+     } else {
+         return {};
+     }
+ }
+ 
 
 ///minimum size required for awaiting_callback working with given T
 /**
@@ -1070,7 +1130,6 @@ protected:
         read_state_frame(awaitable *src):src(src) {}
 
         void do_resume();
-        void do_destroy() {}
     };
 
     struct read_ptr_frame: coro_frame<read_ptr_frame>{
@@ -1080,7 +1139,6 @@ protected:
         read_ptr_frame(awaitable *src):src(src) {}
 
         void do_resume();
-        void do_destroy() {}
     };
 
     friend class awaitable_result<T>;
@@ -1283,7 +1341,7 @@ public:
  *
  * if someone calls destroy() delete is called
  */
-template<typename FrameImpl>
+template<typename FrameImpl, bool destroy_is_invalid /*= true*/>
 class coro_frame {
 protected:
     void (*resume)(std::coroutine_handle<>) = [](std::coroutine_handle<> h) {
@@ -1292,7 +1350,11 @@ protected:
     };
     void (*destroy)(std::coroutine_handle<>) = [](std::coroutine_handle<> h) {
         auto *me = reinterpret_cast<FrameImpl *>(h.address());
-        me->do_destroy();
+        if constexpr (destroy_is_invalid) {
+            me->do_resume();
+        } else {
+            me->do_destroy();
+        }
     };
 
     ///default implementation. Implement own version with a code to perform
@@ -1340,7 +1402,7 @@ requires(requires(awaitable<T> &awt, Instance instance, Args &... args){
     {((*instance).*member_fn)(awt, args...)};
 })
 class await_member_callback :
-        public coro_frame<await_member_callback<T, Instance, member_fn, Args...> >{
+        public coro_frame<await_member_callback<T, Instance, member_fn, Args...> , false>{
 public:
     await_member_callback() {}
 
@@ -1400,7 +1462,7 @@ public:
         if (_awt.await_ready()) {
             return this->get_handle();
         } else {
-            return _awt.await_suspend(this->get_handle());
+            return call_await_suspend(_awt, this->get_handle());
         }
     }
 
@@ -1409,14 +1471,11 @@ protected:
     std::optional<std::tuple<Args...> >_args;
     awaitable<T> _awt;
 
-    friend class coro_frame<await_member_callback<T, Instance, member_fn, Args...> >;
+    friend class coro_frame<await_member_callback<T, Instance, member_fn, Args...> , false>;
     auto do_resume() {
         return std::apply([&](auto & ... args){
             return ((*_instance).*member_fn)(_awt, args...);
         }, *_args);
-    }
-    void do_destroy() {
-        //empty
     }
 };
 
@@ -1439,7 +1498,7 @@ protected:
  *
  */
 template<typename T, std::invocable<awaitable<T> &> _CB, coro_allocator _Allocator >
-class awaiting_callback : public coro_frame<awaiting_callback<T, _CB, _Allocator> >
+class awaiting_callback : public coro_frame<awaiting_callback<T, _CB, _Allocator> , false>
                         , public _Allocator::overrides
 {
 public:
@@ -1485,7 +1544,7 @@ protected:
         delete this;
     }
 
-    friend class coro_frame<awaiting_callback<T, _CB, _Allocator> >;
+    friend class coro_frame<awaiting_callback<T, _CB, _Allocator> , false>;
 };
 
 template <typename T>
@@ -1654,90 +1713,62 @@ public:
         for (auto &x: list) add(x);
     }
 
+    ~when_all() {
+        wait();
+    }
 
-    ///add an awaitable object to set
-    /** Intended way is to add multiple awaitables to the set
-     * before you start to awaiting
-     *
-     * @param awt awaitable object or direct awaiter
-     * @return because result of operation can be resumption of an
-     * coroutine, its prepared handle is returned now. You can ignore
-     * return value in most of cases
-     *
-     * @note function only registers the awaitable object. It is now
-     * in in pending state and you need to keep it until it is evaluated
-     *
+    ///Add awaiter to list of awaiting awaiters.
+    /**  
+     * The function must be called before co_await or wait(). This allows programatically
+     * add new awaiters before waiting on them
+     * @param awt awaiter to add
      */
     template<is_awaiter X>
     prepared_coro add(X &awt) {
         if (!awt.await_ready()) {
             _cnt.count.fetch_add(1, std::memory_order_relaxed);
-
-            if constexpr (std::is_void_v<decltype(awt.await_suspend(_cnt.get_handle()))>) {
-                awt.await_suspend(_cnt.get_handle());
-                return {};
-            } else {
-                auto r = awt.await_suspend(_cnt.get_handle());
-                if constexpr(std::is_convertible_v<decltype(r), bool>) {
-                    if (!r) {
-                        _cnt.count.fetch_sub(1, std::memory_order_relaxed);
-                    }
-                    return {};
-                } else {
-                    return r;
-                }
-            }
+            return call_await_suspend(awt, _cnt.get_handle());
         }
         return {};
     }
 
-    ///start awaiting operation
-    awaitable<void> operator co_await() {
-        return start();
+    ///implements co_await
+    bool await_ready() const noexcept {
+        return (_cnt.count.load(std::memory_order_acquire) <= 1);
     }
 
-    ///retrieve awaitable for this object
-    awaitable<void> get_awaitable() {
-        return start();
+    ///implements co_await
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> me) noexcept {
+        _cnt.r  = me;
+        return _cnt.do_resume().symmetric_transfer();
     }
 
-    ///wait synchronously
+    ///doesn't return anything
+    static void await_resume() noexcept {} 
+
+    ///perform sync await
     void wait() {
-        start().wait();
+        sync_await(*this);
     }
 
     ///reset state
+    /** You can only reset state after successful co_await. This allows to reuse the object */
     bool reset() {
         unsigned int need = 0;
         return _cnt.count.compare_exchange_strong(need,1);
     }
 
 protected:
-
-    //start co_await operation
-    awaitable<void> start() {
-        if (_cnt.count.load(std::memory_order_acquire) == 1) {
-            return {};
-        }
-        //this is asynchronous operation
-        return [this](awaitable_result<void> r) {
-            //publish result object
-            _cnt.r = std::move(r);
-            //check counter
-            _cnt.do_resume();
-        };
-    }
-
     struct counter: coro_frame<counter> {
         std::atomic<unsigned int> count = {1};
-        awaitable_result<void> r = {};
+        prepared_coro r = {};
         prepared_coro do_resume() {
             //test whether we reached zero
             if (count.fetch_sub(1, std::memory_order_relaxed)  == 1) {
                 //ensure that all results are visible
                 count.load(std::memory_order_acquire);
                 //resume awaiting coroutine
-                return r();
+                return std::move(r);
             }
             //still pending
             return {};
@@ -1815,42 +1846,22 @@ public:
         while (_nx < _cnt) wait();
     }
 
-
-    ///retrieve awaitable object for next complete awaitable
-    /**
-     * @return the awaitable object. The result itself is
-     * zero base index of awaitable which is ready for result
-     * retrieval.
-     *
-     * To retrieve result of the awaitable, you need just call
-     * await_resume() of complete awaitable (which index is returned
-     * by this function)
-     *
-     */
-    awaitable<unsigned int> get_awaitable() {
-        if (_nx == _cnt) return nullptr;
-        unsigned int v = _finished[_nx].load(std::memory_order_acquire);
-        if (v != 0) {
-            ++_nx;
-            return v - 2;
-        }
-        return [this](awaitable<unsigned int>::result r) {
-            _r = std::move(r);
-            std::size_t v = _finished[_nx].exchange(1, std::memory_order_acquire);
-            if (v != 0) {
-                ++_nx;
-                _r(v-2);
-            }
-        };
+    bool await_ready() const {
+        return _nx >= _cnt || _finished[_nx].load(std::memory_order_relaxed) != 0;
     }
 
-    ///co_await to wait until next awaitable is complete
-    /**
-     * @return is co_awaited, it returns index of awaitable object
-     * which is complete. To retrieve result, you need to call
-     * await_resume of this awaitable
-     */
-    awaitable<unsigned int> operator co_await() {return get_awaitable();}
+    unsigned int await_resume() {
+        if (_nx >= _cnt) return _nx;
+        unsigned int r = _finished[_nx].load(std::memory_order_acquire);
+        ++_nx;
+        return r - 2;
+    }
+
+    bool await_suspend(std::coroutine_handle<> h) {
+        _r = h;
+        unsigned int need = 0;
+        return _finished[_nx].compare_exchange_strong(need, 1, std::memory_order_relaxed);
+    }
 
     ///Wait synchronously
     /**
@@ -1858,7 +1869,7 @@ public:
      @return index of complete awaitable
      */
     unsigned int wait() {
-        return get_awaitable();
+        return sync_await(*this);
     }
 
     ///determines, whether there are still pending awaitables
@@ -1882,9 +1893,6 @@ protected:
         prepared_coro do_resume() {
             return _parent->resumed(this);
         }
-        void do_destroy() {
-
-        }
     };
 
     ///list of prepared fake-coroutines to catch resume attempt
@@ -1903,7 +1911,7 @@ protected:
     unsigned int _nx = 0;
     ///contains count of slots
     unsigned int _cnt = 0;
-    awaitable<unsigned int>::result  _r = {};
+    prepared_coro _r = {};
 
     ///register to slot
     /**
@@ -1924,29 +1932,7 @@ protected:
             return {};
         } else {
             //if not - depend of type await_suspend
-            //void return
-            if constexpr (std::is_void_v<decltype(awt.await_suspend(_slots[idx].get_handle()))>) {
-                //suspend
-                awt.await_suspend(_slots[idx].get_handle());
-                //return nothing
-                return {};
-            } else {
-                //suspend and retrieve value
-                auto r = awt.await_suspend(_slots[idx].get_handle());
-                //if value is bool
-                if constexpr(std::is_convertible_v<decltype(r), bool>) {
-                    //if bool is false - suspension did not happened
-                    if (!r) {
-                        //mark resumed
-                        return resumed(&_slots[idx]);
-                    }
-                    //suspend ok
-                    return {};
-                } else {
-                    //if std::coroutine_handle is returned return it as prepared_coro
-                    return r;
-                }
-            }
+            return call_await_suspend(awt, _slots[idx].get_handle());            
         }
     }
 
@@ -1965,14 +1951,7 @@ protected:
         //exchange value
         unsigned int st = _finished[wridx].exchange(v, std::memory_order_release);
         //if there is 1, somebody already awaiting
-        if (st == 1) {
-            //advance _nx (we can, nobody else will be there)
-            ++_nx;
-            //resume awaiting coroutine
-            return _r(idx);
-        }
-        //nothing to resume
-        return {};
+        return (st == 1)?std::move(_r):prepared_coro();
     }
 };
 
@@ -2070,23 +2049,6 @@ awaitable<typename awaitable<T>::store_type *> awaitable<T>::begin() {
     };
 }
 
-template<typename _Awt>
-prepared_coro call_await_resume(_Awt &&awt, std::coroutine_handle<> handle) {
-    using Ret = decltype(awt.await_suspend(handle));
-    static_assert(std::is_void_v<Ret>
-                || std::is_convertible_v<Ret, std::coroutine_handle<> >
-                || std::is_convertible_v<Ret, bool>);
-
-    if constexpr(std::is_convertible_v<Ret, std::coroutine_handle<> >) {
-        return prepared_coro(awt.await_suspend(handle));
-    } else if constexpr(std::is_convertible_v<Ret, bool>) {
-        bool b = awt.await_suspend(handle);
-        return b?prepared_coro():prepared_coro(handle);
-    } else {
-        return {};
-    }
-}
-
 template<typename T>
 concept basic_lockable = requires(T v) {
     {v.lock()};
@@ -2142,6 +2104,33 @@ protected:
 
 };
 
+template<is_awaitabe T>
+inline awaiter_result<T> sync_await(T &&awt) {
+    if constexpr(has_co_await<T>) {
+        return sync_await(awt.operator co_await());
+    } else if constexpr(has_global_co_await<T>) {
+        return sync_await(operator co_await(awt));
+    } else {
+        if (awt.await_ready()) return awt.await_resume();
+        sync_frame sf;
+        auto h = sf.get_handle();
+        if constexpr(std::is_void_v<decltype(awt.await_suspend(h))>) {
+            awt.await_suspend(h);
+        } else {
+            auto r = awt.await_suspend(h);
+            if constexpr(std::is_convertible_v<decltype(r), bool>) {
+                bool b = r;
+                if (!b) sf.set_done();
+            } else {
+                r.resume();
+            }
+        }
+        sf.wait();
+    }
+    return awt.await_resume();
+}
+
+
 template<typename T>
 inline void awaitable<T>::wait() {
     if (!await_ready()) {
@@ -2150,5 +2139,6 @@ inline void awaitable<T>::wait() {
         sync.wait();
     }
 }
+
 
 }

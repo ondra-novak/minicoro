@@ -395,17 +395,25 @@ public:
      *
      * function similar as co_await, however runs scheduler while awaiting
      */
-    template<typename Awt>
-    decltype(auto) await(Awt &&awt) {
+    template<is_awaiter Awt>
+    auto await(Awt &&awt) {
 
         if (!awt.await_ready()) {
             stop_source_coro_frame stpsrc;
-            call_await_resume(std::forward<Awt>(awt), stpsrc.get_handle());
+            call_await_suspend(awt, stpsrc.get_handle());
             run_thread(stpsrc.get_token());
         }
         return awt.await_resume();
-
     }
+    template<has_co_await Awt>
+    auto await(Awt &&awt) {
+        return await(awt.operator co_await());
+    }
+    template<has_global_co_await Awt>
+    auto await(Awt &&awt) {
+        return await(operator co_await(awt));
+    }
+
 
     ///create thread and run scheduler
     /**
